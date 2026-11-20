@@ -1,6 +1,6 @@
 # Herdr 团队协调器 (herdr-team-coordinator)
 
-面向 Windows 平台 [Herdr App](https://github.com/herdr) 与 `hc`（`herdr-core >= 0.1.21`）的多 Agent 团队协调器 Mod。通过主控会话拆解目标、协调派工，也可直接与指定成员沟通，共用同一份团队对话、任务记录与验收条件。协调器负责写锁仲裁、版本变更与独立审查，本地恢复面板用于人工核对和高风险审批。
+面向 Windows 平台 [Herdr App](https://github.com/herdrdev/herdr-app) 与 `hc`（`herdr-core >= 0.1.21`）的多 Agent 团队协调器 Mod。通过主控会话拆解目标、协调派工，也可直接与指定成员沟通，共用同一份团队对话、任务记录与验收条件。协调器负责写锁仲裁、版本变更与独立审查，本地恢复面板用于人工核对和高风险审批。
 
 支持协调 **Codex**、**Antigravity (`agy`)** 与 **DSH (`dsh` / `dst`)** 终端会话。
 
