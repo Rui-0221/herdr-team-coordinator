@@ -96,6 +96,77 @@ class CoordinatorTests(unittest.TestCase):
         with self.app.tx(False) as db:
             return dict(db.execute('SELECT * FROM outbox WHERE id=?', (identifier,)).fetchone())
 
+    def test_message_replay_queue_and_stale_task_version(self):
+        panel = {'run_id': self.run, 'message_id': new_id(), 'text': '检查界面'}
+        self.assertEqual(self.app.local('say', panel), self.app.local('say', panel))
+        action = {**self.dispatch_params(), 'source': panel['message_id']}
+        task = self.member('dispatch', action)['result']['task_id']
+        self.assertEqual(task, self.member('dispatch', action)['result']['task_id'])
+        self.assertFalse(self.member('dispatch', {**action, 'title': '另一个任务'})['ok'])
+        queued = self.member('dispatch', self.dispatch_params())['result']
+        self.assertEqual(queued['state'], 'queued')
+        self.assertFalse(self.member('accept', self.task_ticket(queued['task_id']), self.dev)['ok'])
+        ticket = self.task_ticket(task)
+        self.assertTrue(self.member('accept', ticket, self.dev)['ok'])
+        change = {'task_id': task, 'version': 1, 'completion': '可按键盘导出'}
+        self.assertFalse(self.member('amend-task', change, self.reviewer)['ok'])
+        self.assertTrue(self.member('amend-task', change, self.dev)['ok'])
+        self.assertFalse(self.member('amend-task', change)['ok'])
+        handoff = {**ticket, 'report': '核对完毕', 'version': 2}
+        self.assertFalse(self.member('handoff', handoff, self.dev)['ok'])
+        self.assertTrue(self.member('ack-task', {**ticket, 'version': 2}, self.dev)['ok'])
+        self.assertFalse(self.member('handoff', {**handoff, 'version': 1}, self.dev)['ok'])
+        self.assertTrue(self.member('handoff', handoff, self.dev)['ok'])
+        self.app.maintenance(inspect=False)
+        self.assertTrue(self.member('accept', self.task_ticket(queued['task_id']), self.dev)['ok'])
+
+    def test_forwarded_message_keeps_task_context_and_reply_history(self):
+        initial = {'run_id':self.run, 'to':self.dev, 'message_id':new_id(), 'text':'帮我协调一个新任务'}
+        self.app.local('say', initial)
+        forward = {'source':initial['message_id'], 'to':'lead', 'text':'请主控选择成员'}
+        forwarded = self.member('say', forward, self.dev)['result']['message_id']
+        self.assertFalse(self.member('say', {'source':forwarded,'text':'错用消息'}, self.dev)['ok'])
+        params = {**self.dispatch_params(), 'source':forwarded}
+        result = self.member('dispatch', params)['result']
+        task = result['task_id']
+        history = self.member('history', {'task_id':task})['result']['conversation']
+        self.assertEqual([m['id'] for m in history], [initial['message_id'], forwarded])
+        reply = {'run_id':self.run, 'message_id':new_id(), 'reply_to':initial['message_id'], 'text':'刚才那个再加键盘'}
+        self.app.local('say', reply)
+        pending = self.member('status')['result']['pending_messages']
+        self.assertEqual([(m['id'],m['task_id']) for m in pending], [(reply['message_id'],task)])
+        self.member('amend-task', {'version':1, 'task_id':task, 'completion':'键盘', 'source':reply['message_id']})
+        old = self.member('history', {'task_id':task,'version':1})['result']['requirements']
+        current = self.member('history', {'task_id':task})['result']['requirements']
+        self.assertEqual(old['completion'], self.dispatch_params()['completion'])
+        self.assertIn('键盘', current['completion'])
+        self.assertFalse(self.member('history', {'task_id':task,'version':4})['ok'])
+
+    def test_reopen_handoff_invalidates_acceptance_and_uses_new_round(self):
+        task, _ = self.dispatch()
+        ticket = self.task_ticket(task)
+        self.assertTrue(self.member('accept', ticket, self.dev)['ok'])
+        (self.project / 'out.txt').write_text('result', encoding='utf8')
+        self.assertTrue(self.member('handoff', {**ticket, 'paths':['out.txt'], 'report':'一轮'}, self.dev)['ok'])
+        review = self.member('review-start', {'role_id':self.reviewer, 'paths':['out.txt']})['result']
+        reviewer = self.member('status', role=self.reviewer)['result']['candidates'][0]
+        r_ticket = {'task':review['task_id'], 'ticket':reviewer['ticket']}
+        self.member('accept', r_ticket, self.reviewer)
+        self.member('review-submit', {**r_ticket, 'review_id':review['review_id'], 'verdict':'pass', 'report':'通过'}, self.reviewer)
+        question = self.member('ask', {'purpose':'acceptance','text':'验收？'})['result']
+        change = self.member('amend-task', {'task_id':task, 'instructions':'支持键盘', 'version':1})['result']
+        self.assertEqual((change['task_id'], change['state']), (task, 'offered'))
+        self.assertFalse(self.member('answer', {'question_id':question['question_id'], 'response':'yes'})['ok'])
+        self.assertFalse(self.member('accept', ticket, self.dev)['ok'])
+        new_ticket = self.task_ticket(task)
+        self.member('accept', new_ticket, self.dev)
+        self.member('ack-task', {**new_ticket,'version':2}, self.dev)
+        self.assertTrue(self.member('handoff', {**new_ticket, 'version':2, 'paths':['out.txt'], 'report':'二轮'}, self.dev)['ok'])
+        self.member('review-start', {'role_id':self.reviewer, 'paths':['out.txt']})
+        status = self.member('status')['result']
+        self.assertEqual(len(status['review']['handoffs']), 1)
+        self.assertEqual(len([h for h in status['handoffs'] if h['task_id'] == task]), 2)
+
     def test_lost_dispatch_reply_is_recovered_from_same_request(self):
         params = self.dispatch_params()
         issued = self.member('issue', {'action': 'dispatch', 'params': params})
@@ -369,10 +440,26 @@ class CoordinatorTests(unittest.TestCase):
         self.assertTrue(cli('dev2', 'request-write')['result']['waiting'])
         blk = cli('dev2', 'blocked', '--reason', '等待 dev1', '--depends-on-role', self.dev, '--depends-on-resource', 'worktree')
         self.assertEqual(blk['result']['depends_on_role'], self.dev)
+        # A member and the lead amend the same live writer through the real CLI.
+        direct = cli(self.dev, 'say', '--to', self.dev, '--text', '也要支持键盘', '--task-id', d1)['result']['message_id']
+        cli(self.dev, 'amend-task', '--source', direct, '--task-id', d1, '--version', '1', '--completion', '键盘可操作')
+        message = {'run_id': run_id, 'message_id': new_id(), 'reply_to': direct, 'text': '刚才那个还要显示焦点'}
+        self.app.local('say', message)
+        status = cli('lead', 'status')['result']
+        self.assertTrue(next(m for m in status['members'] if m['role_id'] == 'dev2')['duties'])
+        self.assertEqual(status['pending_messages'][0]['task_id'], d1)
+        cli('lead', 'amend-task', '--source', message['message_id'], '--task-id', d1, '--version', '2', '--completion', '焦点可见')
+        cli(self.dev, 'ack-task', '--version', '3')
+        status = cli('lead', 'status')['result']
+        self.assertEqual(status['run']['revision'], 1)
+        self.assertEqual(next(t for t in status['tasks'] if t['id'] == d2)['task_version'], 1)
+        self.assertEqual(next(t for t in status['tasks'] if t['id'] == d1)['ack_version'], 3)
+        self.assertEqual(len(status['write_grants']), 1)
+        self.assertEqual(len(cli('lead', 'history')['result']['conversation']), 2)
         # dev1 hands off -> selected.json cleared & dev2 block resolved!
         (self.project / 'out.txt').write_text('v1', encoding='utf-8')
         stopped = __import__('json').dumps({'evidence': {'stopped': True, 'processes': 'none', 'files': 'out.txt', 'external': 'none'}})
-        cli(self.dev, 'handoff', '--report', 'finished A', '--paths', 'out.txt', '--json', stopped)
+        cli(self.dev, 'handoff', '--version', '3', '--report', 'finished A', '--paths', 'out.txt', '--json', stopped)
         self.assertFalse((self.data / 'requests' / b[self.dev]['id'] / 'selected.json').exists())
         # dev2 runs exact same `request-write` command WITHOUT --new-request -> MUST NOT replay waiting: true!
         got_lock = cli('dev2', 'request-write')
@@ -381,6 +468,9 @@ class CoordinatorTests(unittest.TestCase):
         # Review fails, then rework, then review-start AGAIN with exact same args -> MUST create new review_id!
         r1 = cli('lead', 'review-start', '--role-id', self.reviewer, '--paths', 'out.txt', writable_journal=False)['result']
         rt1 = next(c['ticket'] for c in cli(self.reviewer, 'status', writable_journal=False)['result']['candidates'] if c['id'] == r1['task_id'])
+        reviewed = next(c for c in cli(self.reviewer, 'status')['result']['candidates'] if c['id'] == r1['task_id'])
+        self.assertIn('键盘可操作', reviewed['instructions'])
+        self.assertIn('焦点可见', reviewed['instructions'])
         cli(self.reviewer, 'accept', '--task', r1['task_id'], '--ticket', rt1, writable_journal=False)
         cli(self.reviewer, 'review-submit', '--review-id', r1['review_id'], '--verdict', 'fail', '--report', 'fix', '--task', r1['task_id'], '--ticket', rt1, writable_journal=False)
         d3 = cli('lead', 'dispatch', '--role', self.dev, '--title', 'A2', '--instructions', 'fix A', '--completion', 'fixed', '--mode', 'write', writable_journal=False)['result']['task_id']

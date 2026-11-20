@@ -9,7 +9,7 @@ from common import DomainError, new_id, now
 
 
 HIGH_RISK = {'delete', 'permission', 'provider'}
-LIVE_TASKS = ('offered', 'accepted', 'blocked', 'yielded', 'handed_off', 'needs_decision')
+LIVE_TASKS = ('queued','offered', 'accepted', 'blocked', 'yielded', 'handed_off', 'needs_decision')
 ROUTES = {
     'pause', 'resume', 'cancel-task', 'change-goal', 'resolve-revision', 'request-write', 'yield', 'handoff',
     'review-start', 'review-submit', 'ask', 'answer', 'local-accept', 'recover-write',
@@ -18,6 +18,11 @@ ROUTES = {
 
 def install_workflow_schema(db):
     db.executescript('''
+        CREATE TABLE IF NOT EXISTS workflow_task_versions (
+            task_id TEXT NOT NULL REFERENCES tasks(id), version INTEGER NOT NULL, round INTEGER NOT NULL,
+            instructions TEXT NOT NULL, completion TEXT NOT NULL, recorded REAL NOT NULL,
+            PRIMARY KEY(task_id, version)
+        );
         CREATE TABLE IF NOT EXISTS workflow_grants (
             id TEXT PRIMARY KEY, run_id TEXT NOT NULL REFERENCES runs(id),
             task_id TEXT NOT NULL REFERENCES tasks(id), binding_id TEXT NOT NULL REFERENCES bindings(id),
@@ -77,6 +82,69 @@ def install_workflow_schema(db):
             created REAL NOT NULL, resolved REAL
         );
     ''')
+    columns = {row[1] for row in db.execute('PRAGMA table_info(tasks)')}
+    for column in ('task_version', 'ack_version'):
+        if column not in columns:
+            db.execute(f'ALTER TABLE tasks ADD COLUMN {column} INTEGER NOT NULL DEFAULT 1')
+
+
+def amend_task(db, run, actor, params):
+    task = _row(db, 'SELECT t.*, b.kind FROM tasks t JOIN bindings b ON b.id=t.binding_id WHERE t.id=? AND t.run_id=? AND b.active=1',
+                params.get('task_id'), run['id'])
+    if (not task or task['kind'] != 'member' or run['state'] != 'active' or task['revision'] != run['revision']
+            or task['state'] not in ('queued','offered','accepted','blocked','yielded','handed_off')):
+        raise DomainError('请选择当前目标下可调整的执行任务。')
+    if actor['kind'] != 'master' and task['binding_id'] != actor['binding_id']:
+        raise DomainError('成员仅可调整自己的执行任务。')
+    check_task_version(task, params)
+    mode = params.get('edit', 'append')
+    if mode not in ('append','replace') or not any(k in params for k in ('instructions','completion')):
+        raise DomainError('需要提供执行要求或验收条件。')
+    values = {}
+    for key in ('instructions','completion'):
+        value = task[key]
+        if key in params:
+            addition = _required(params, key, key)
+            value = value + '\n' + addition if mode == 'append' else addition
+        if len(value) > 24000:
+            raise DomainError('任务要求过长，请整理后用 replace 更新。')
+        values[key] = value
+    state, round_no, ticket = task['state'], task['round'], task['capability']
+    if state == 'handed_off':
+        busy = _row(db, """SELECT id FROM tasks WHERE binding_id=? AND revision=? AND state IN
+                          ('queued','offered','accepted','blocked','yielded')""", task['binding_id'], run['revision'])
+        state = 'queued' if busy else 'offered'
+        round_no = _row(db, 'SELECT MAX(round)+1 FROM tasks WHERE run_id=? AND role_id=?', run['id'], task['role_id'])[0]
+        ticket = new_id()
+    db.execute('''INSERT INTO workflow_task_versions(task_id,version,round,instructions,completion,recorded)
+                  VALUES(?,?,?,?,?,?)''',
+               (task['id'], task['task_version'], task['round'], task['instructions'], task['completion'], now()))
+    db.execute('''UPDATE tasks SET instructions=?,completion=?,task_version=task_version+1,
+                  state=?,round=?,capability=? WHERE id=?''',
+               (values['instructions'], values['completion'], state, round_no, ticket, task['id']))
+    invalidate_review(db, run['id'], '任务要求或验收条件已更新。')
+    version = task['task_version'] + 1
+    return {'task_id': task['id'], 'task_version': version, 'state': state,
+            '_notices': [{'binding_id': task['binding_id'], 'task_id': task['id'],
+                          'text': f'任务「{task["title"]}」已更新到第 {version} 版，请查看要求并 ack-task。'}]}
+
+
+def task_requirements(db, run_id, task_id, version=None):
+    task = _row(db, 'SELECT * FROM tasks WHERE id=? AND run_id=?', task_id, run_id)
+    if not task:
+        raise DomainError('找不到本团队的任务')
+    if version is None or version == task['task_version']:
+        return {key: task[key] for key in ('id','task_version','round','instructions','completion')}
+    row = _row(db, '''SELECT task_id AS id,version AS task_version,round,instructions,completion
+                      FROM workflow_task_versions WHERE task_id=? AND version=?''', task_id, version)
+    if not row:
+        raise DomainError('任务需求版本不存在')
+    return dict(row)
+
+
+def check_task_version(task, params):
+    if type(params.get('version')) is not int or task['task_version'] != params['version']:
+        raise DomainError('请先读取 status 中的 task_version，用 --version 指定核对过的版本。')
 
 
 def _row(db, sql, *values):
@@ -556,7 +624,7 @@ def _change_goal(db, run, params):
     revoked = []
     decisions = []
     for task in old_tasks:
-        if task['state'] == 'offered' and not _row(db, '''SELECT id FROM outbox WHERE task_id=?
+        if task['state'] == 'queued' or task['state'] == 'offered' and not _row(db, '''SELECT id FROM outbox WHERE task_id=?
                 AND state IN ('sending','delivered','unknown','stale_delivery') LIMIT 1''', task['id']):
             db.execute("UPDATE tasks SET state='cancelled' WHERE id=?", (task['id'],))
             revoked.append(task['id'])
@@ -577,7 +645,7 @@ def _cancel_task(db, run, params):
     reason = _required(params, 'reason', '撤回原因')
     task_id = _required(params, 'task_id', '要撤回的任务编号', 100)
     task = _row(db, 'SELECT * FROM tasks WHERE id=? AND run_id=? AND revision=?', task_id, run['id'], run['revision'])
-    if not task or task['state'] not in ('offered', 'accepted', 'blocked', 'yielded'):
+    if not task or task['state'] not in ('queued', 'offered', 'accepted', 'blocked', 'yielded'):
         raise DomainError('请选择本目标版本尚未完成的任务。')
     grants = _active_releases(db, task)
     invalidate_review(db, run['id'], '当前任务已撤回。')
@@ -603,7 +671,7 @@ def _resolve_revision(db, run, params, offer):
     carried = _required(params, 'carried', '旧成果处理说明')
     if choice != 'cancel' and _active_releases(db, prior):
         raise DomainError('旧轮次仍持有写入资格。', '保留进度并联系实际持有人交还。')
-    completed_handoff = _row(db, "SELECT * FROM workflow_handoffs WHERE task_id=? AND kind='handoff' ORDER BY rowid DESC LIMIT 1", prior['id'])
+    completed_handoff = _row(db, "SELECT * FROM workflow_handoffs WHERE task_id=? AND round=? AND kind='handoff' ORDER BY rowid DESC LIMIT 1", prior['id'], prior['round'])
     replacement = None
     if choice == 'reuse' and completed_handoff:
         # Preserve the completed deliverable directly in the new revision without forcing redundant rework.
@@ -611,7 +679,7 @@ def _resolve_revision(db, run, params, offer):
                               (run['id'], prior['role_id'])).fetchone()[0]
         carried_task = new_id()
         db.execute("UPDATE tasks SET state='superseded' WHERE id=?", (prior['id'],))
-        db.execute('''INSERT INTO tasks VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
+        db.execute('''INSERT INTO tasks(id,run_id,role_id,binding_id,round,revision,title,instructions,required,completion,mode,state,capability,created) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
                    (carried_task, run['id'], prior['role_id'], prior['binding_id'], round_no, run['revision'],
                     prior['title'], prior['instructions'], prior['required'], prior['completion'],
                     prior['mode'], 'handed_off', new_id(), now()))
@@ -627,7 +695,8 @@ def _resolve_revision(db, run, params, offer):
         instructions = _required(params, 'instructions', '调整后的指令') if choice == 'adjust' else prior['instructions']
         instructions += f"\n\n原任务 {prior['id']} 达成的成果及当前接手范围：{carried}。请先核对沿用成果。"
         db.execute("UPDATE tasks SET state='superseded' WHERE id=?", (prior['id'],))
-        replacement = offer(db, run, binding, prior['title'], instructions, prior['required'], prior['completion'], prior['mode'])
+        completion = _required(params, 'completion', '验收条件') if choice == 'adjust' and 'completion' in params else prior['completion']
+        replacement = offer(db, run, binding, prior['title'], instructions, prior['required'], completion, prior['mode'])
     else:
         db.execute("UPDATE tasks SET state='cancelled' WHERE id=?", (prior['id'],))
     db.execute('''INSERT INTO workflow_revision_decisions(task_id,run_id,revision,decision,carried,replacement_task,created)
@@ -658,8 +727,8 @@ def _review_inputs(db, run):
                              AND state NOT IN ('handed_off','superseded','cancelled')''', (run['id'], run['revision'])).fetchall()
     if missing:
         raise DomainError(f"必做任务仍未完成交接：{', '.join(row['title'] for row in missing)}。", '核对完成条件并取得正式交接。')
-    handoffs = db.execute('''SELECT h.*, t.binding_id, t.required FROM workflow_handoffs h JOIN tasks t ON t.id=h.task_id
-                             WHERE h.run_id=? AND h.revision=? AND h.kind='handoff' AND t.state='handed_off' ORDER BY h.id''',
+    handoffs = db.execute('''SELECT h.*, t.binding_id, t.required,t.instructions,t.completion,t.task_version FROM workflow_handoffs h JOIN tasks t ON t.id=h.task_id
+                             WHERE h.run_id=? AND h.revision=? AND h.kind='handoff' AND h.round=t.round AND t.state='handed_off' ORDER BY h.id''',
                           (run['id'], run['revision'])).fetchall()
     if not any(row['required'] for row in handoffs):
         raise DomainError('当前目标版本还没有已交接的必做任务成果。', '先派发并完成至少一项必做任务的正式交接。')
@@ -693,7 +762,7 @@ def _review_start(db, run, params, offer):
                 'next': '解决不可核对项目或明确划分审查范围后重新发起。'}
     invalidate_review(db, run['id'], '新审查批次替换了旧批次。')
     review_id = new_id()
-    report_lines = [f"{handoff['role_id']} / {handoff['task_id']} / 第 {handoff['round']} 轮 / 交接 {handoff['id']}"
+    report_lines = [f"{handoff['role_id']} / {handoff['task_id']} / 第 {handoff['round']} 轮 / 交接 {handoff['id']} / 任务版本 {handoff['task_version']}\n要求：{handoff['instructions']}\n验收：{handoff['completion']}"
                     for handoff in handoffs]
     instructions = (f"以只读方式审查目标版本 {run['revision']} 的成果。\n审查编号 {review_id}\n"
                     f"工作目录：{run['root']}\n成果清单：{_dump(paths)}\n指纹：{manifest['digest']}\n"

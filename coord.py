@@ -13,12 +13,17 @@ from platform_runtime import PipeServer, request, service_mutex
 from supervisor import start, status, stop
 
 
-TASK_ACTIONS = ('accept', 'blocked', 'request-write', 'yield', 'handoff', 'review-submit')
-TEAM_ACTIONS = ('dispatch', 'cancel-task', 'pause', 'resume', 'change-goal', 'resolve-revision', 'review-start', 'ask', 'answer')
+TASK_ACTIONS = ('ack-task', 'accept', 'blocked', 'request-write', 'yield', 'handoff', 'review-submit')
+TEAM_ACTIONS = ('say', 'amend-task', 'dispatch', 'cancel-task', 'pause', 'resume', 'change-goal', 'resolve-revision', 'review-start', 'ask', 'answer')
 FORMATS = '''
 在角色绑定的终端中使用接入指令。以下以 coord 代指接入指令。
 
   coord status                           查询本轮工作、待办与交接
+  coord say --text "用户原话或答复" [--to 角色ID] [--source 消息ID] [--reply-to 消息ID] [--task-id ID]
+  coord history [--before 消息序号]        分页查看团队对话
+  coord amend-task --task-id ID --version N [--instructions 要求] [--completion 验收条件] [--edit append|replace] [--source 消息ID]
+  coord ack-task --task ID --ticket 凭据 --version N
+  新版任务交接、申请写入时也要带 --version N。派工可用 --source 消息ID，成员忙时自动排队。
   coord requests                         查询请求编号及入库结果
   coord accept --task ID --ticket 凭据   使用本轮 status 返回的接单参数
   coord blocked --reason "依赖与证据" [--depends-on-role 角色] [--depends-on-task ID] [--depends-on-resource worktree|refs]
@@ -171,8 +176,8 @@ def member_action(args, root, params):
     journal = expected if raw_journal and Path(raw_journal).resolve() == expected else None
     auth = {'terminal': terminal, 'binding': binding, 'token': token}
     action = args.action
-    if action in ('status', 'requests'):
-        answer = call(root, {'action': action, 'auth': auth}, 'member')
+    if action in ('status', 'requests', 'history'):
+        answer = call(root, {'action': action, 'auth': auth, 'params': params}, 'member')
         if action == 'status' and journal and answer.get('ok'):
             selected = journal_read(journal / 'selected.json')
             if selected.get('task'):
@@ -233,21 +238,29 @@ def parser():
     local.add_argument('local_action')
     local.add_argument('--root', default=argparse.SUPPRESS)
     local.add_argument('--json')
-    for action in ('status', 'requests', *TASK_ACTIONS, *TEAM_ACTIONS):
+    for action in ('status', 'requests', 'history', *TASK_ACTIONS, *TEAM_ACTIONS):
         command = actions.add_parser(action)
         command.add_argument('--json')
         command.add_argument('--request-id')
         command.add_argument('--new-request', action='store_true')
-        options = {'dispatch': ('role', 'title', 'instructions', 'completion', 'mode'),
+        options = {'dispatch': ('role', 'title', 'instructions', 'completion', 'mode','source'),
+                   'say': ('text','to','source','reply_to','task_id','message_id'),
+                   'amend-task': ('task_id','instructions','completion','source','edit','text'),
                    'blocked': ('reason', 'depends_on_role', 'depends_on_task', 'depends_on_resource'),
                    'request-write': ('path',), 'yield': ('report',), 'handoff': ('report',),
                    'review-submit': ('review_id', 'verdict', 'report'), 'pause': ('reason',), 'cancel-task': ('task_id', 'reason'),
                    'resume': ('task_id',), 'change-goal': ('goal',),
-                   'resolve-revision': ('task_id', 'decision', 'carried', 'instructions', 'role_id'),
+                   'resolve-revision': ('task_id', 'decision', 'carried', 'instructions', 'role_id','completion'),
                    'review-start': ('role_id',), 'ask': ('purpose', 'text', 'replace'),
                    'answer': ('question_id', 'response')}.get(action, ())
         for option in (*options, *(('task', 'ticket') if action in TASK_ACTIONS else ())):
             command.add_argument('--' + option.replace('_', '-'))
+        if action in ('amend-task','ack-task','handoff','request-write'):
+            command.add_argument('--version', type=int)
+        if action == 'history':
+            command.add_argument('--task-id')
+            command.add_argument('--version', type=int)
+            command.add_argument('--before', type=int)
         if action in ('handoff', 'review-start'):
             command.add_argument('--paths', nargs='+')
         for switch in {'dispatch': ('optional',), 'pause': ('emergency',), 'request-write': ('repository_refs',)}.get(action, ()):

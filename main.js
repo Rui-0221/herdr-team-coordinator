@@ -83,6 +83,10 @@ export default class TeamCoordinator extends View {
     this.expanded = {};
     if (checking() || this.role === "button") return;
 
+    this.chatDraft = TextareaState.new({ placeholder: "告诉团队你想做什么，或给当前任务追加条件", rows: 2 });
+    this.chatTarget = "";
+    this.chatReply = null;
+    this.chatAttempt = null;
     this.goal = TextareaState.new({ placeholder: "希望团队完成什么？", rows: 4 });
     this.criteria = TextareaState.new({ placeholder: "可选，例如必须完成的交付物或测试", rows: 2 });
     this.project = InputState.new({ placeholder: "本机项目目录", value: focused()?.cwd ?? "" });
@@ -104,7 +108,7 @@ export default class TeamCoordinator extends View {
       if (!this.busy && this.page === "runs") this.job(cx, async () => {
         this.background = await this.api("status");
         if (this.background?.running || this.background?.scheduler || this.background?.pid || this.background?.state === "running") {
-          this.setDashboard(await this.api("dashboard"));
+          this.setDashboard(await this.api("dashboard", { run_id: this.selectedRun, before: this.chatBefore }));
         }
       }, true);
     });
@@ -141,7 +145,7 @@ export default class TeamCoordinator extends View {
   }
 
   async reload() {
-    this.setDashboard(await this.api("dashboard"));
+    this.setDashboard(await this.api("dashboard", { run_id: this.selectedRun, before: this.chatBefore }));
     this.background = await this.api("status");
   }
 
@@ -334,6 +338,66 @@ export default class TeamCoordinator extends View {
       }) : null, "primary")));
   }
 
+  renderChat(t, current) {
+    const section = group(t, "团队对话");
+    const tasks = rows(current.tasks);
+    for (const msg of rows(current.conversation)) {
+      const who = msg.origin === "panel" ? "你" : msg.sender;
+      const row = item(t, `${who} → ${msg.recipient}`).child(text(t, msg.text));
+      const task = tasks.find(it => it.id === msg.task_id);
+      const confirmation = task?.task_version > 1 ? (task.ack_version === task.task_version ? " · 成员已确认" : " · 等待成员确认") : "";
+      const progress = task ? `${task.title} · 第 ${task.task_version} 版 · ${label(task.state)}${confirmation}` : "";
+      const effect = { dispatch: "已派工", "amend-task": "已更新要求", reply: "已回复", say: "已回应" }[msg.result?.action];
+      row.child(hint(t, [effect ?? (msg.revision === current.revision ? "已记录" : "历史消息"), progress].filter(Boolean).join(" · ")));
+      if (current.state !== "accepted") row.child(button(t, `reply-${msg.seq}`, "引用回复", (_e,cx) => {
+        this.chatReply = msg;
+        this.chatTarget = msg.origin === "panel" ? msg.recipient : msg.sender;
+        cx.notify();
+      }));
+      section.child(row);
+    }
+    const history = rows(current.conversation);
+    if (history.length === 12 || this.chatBefore) {
+      const paging = actions();
+      if (history.length === 12) paging.child(button(t, "chat-earlier", "更早消息", (_e,cx) => this.job(cx, async () => {
+        this.chatBefore = history[0].seq;
+        await this.reload();
+      })));
+      if (this.chatBefore) paging.child(button(t, "chat-latest", "最新消息", (_e,cx) => this.job(cx, async () => {
+        this.chatBefore = null;
+        await this.reload();
+      })));
+      section.child(paging);
+    }
+    if (current.state === "accepted") return section;
+    const targets = actions();
+    const members = rows(current.bindings);
+    const selectedTarget = members.some(b => b.kind === "master" && b.role_id === this.chatTarget) ? "" : this.chatTarget;
+    for (const [id, name] of [["", "团队主控"], ...members.filter(b => b.kind !== "master").map(b => [b.role_id, b.name || b.role_id])]) {
+      targets.child(button(t, `chat-to-${id || "team"}`, name, (_e,cx) => {
+        this.chatTarget = id; cx.notify();
+      }, selectedTarget === id ? "selected" : "normal"));
+    }
+    section.child(targets);
+    if (this.chatReply) section.child(button(t, "chat-clear-reply", `取消引用 · ${this.chatReply.text.slice(0,40)}`, (_e,cx) => {
+      this.chatReply = null; cx.notify();
+    }));
+    section.child(this.field(t, "消息", this.chatDraft, true, 64));
+    return section.child(button(t, "chat-send", "发送", this.busy ? null : (_e,cx) => this.job(cx, async () => {
+      const body = this.chatDraft.value().trim();
+      if (!body) throw Error("请填写消息。");
+      const payload = { run_id: current.id, to: this.chatTarget, reply_to: this.chatReply?.id ?? null, text: body };
+      const key = JSON.stringify(payload);
+      if (this.chatAttempt?.key !== key) this.chatAttempt = { key, id: `panel-${Date.now()}-${Math.random().toString(36).slice(2)}` };
+      await this.api("say", { ...payload, message_id: this.chatAttempt.id });
+      if (this.chatDraft.value().trim() === body) this.chatDraft.set_value("");
+      this.chatReply = null;
+      this.chatAttempt = null;
+      this.chatBefore = null;
+      await this.reload();
+    }), "primary"));
+  }
+
   renderRuns(t) {
     const all = rows(this.data?.runs);
     if (!all.length) return v_flex().gap(9).child(heading(t, "还没有运行"))
@@ -341,7 +405,12 @@ export default class TeamCoordinator extends View {
     const current = all.find(x => x.id === this.selectedRun) ?? all[0];
     const selection = actions();
     for (const entry of all) selection.child(button(t, `run-${entry.id}`, entry.team_name ?? entry.name ?? entry.goal?.slice(0, 20) ?? entry.id, (_e, cx) => {
+      this.chatBefore = null;
+      this.chatTarget = "";
+      this.chatReply = this.chatAttempt = null;
+      this.chatDraft.set_value("");
       this.selectedRun = entry.id;
+      this.job(cx, () => this.reload());
       this.expanded = {};
       this.clearRecoveryEvidence();
       cx.notify();
@@ -362,7 +431,7 @@ export default class TeamCoordinator extends View {
         this.command(cx, paused ? "resume" : "pause", params, paused ? "已请求恢复调度。" : "已请求暂停调度。");
       })));
 
-    const panel = v_flex().gap(13).child(selection).child(title);
+    const panel = v_flex().gap(13).child(selection).child(title).child(this.renderChat(t, current));
     const questions = [...rows(current.questions), workflow.question ?? current.decision].filter(Boolean)
       .filter((row, index, all) => all.findIndex(other => (other.id ?? other.question_id) === (row.id ?? row.question_id)) === index)
       .filter(row => !row.state || ["pending", "open", "awaiting"].includes(row.state));
@@ -491,6 +560,10 @@ export default class TeamCoordinator extends View {
           terminal: terminalAddress(term), instance: terminalInstance(term),
         }])),
       });
+      this.chatBefore = null;
+      this.chatTarget = "";
+      this.chatReply = this.chatAttempt = null;
+      this.chatDraft.set_value("");
       this.selectedRun = result?.id ?? result?.run_id;
       this.page = "runs";
       this.expanded = {};

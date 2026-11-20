@@ -93,6 +93,22 @@ herdr-app do mod.open --name herdr-team-coordinator
 3. 首次在新项目目录拉起 Codex / Antigravity 交互会话时，若 CLI 弹出一次性「信任此文件夹」确认，请在对应终端标签页确认一次；随后主控会自动派工并推进整轮协作。
 4. 最终验收通过后，本轮全部活跃绑定会自动解绑（`active = 0`），终端可立即复用于下一轮任务。
 
+### 与主控或指定成员对话
+
+运行页的「团队对话」默认发给主控。点选成员后，消息进入该成员的待处理列表。「引用回复」会带上原消息及其任务，上下翻阅历史不会改变任务状态。用户也可以打开原生终端直接说话。接入提示要求 Agent 用 `say` 登记影响工作的原话，再用返回的消息 ID 处理。各角色都能读到这段团队记录。
+
+主控根据 `status` 中的职责、交付物和当前任务选择执行者。新任务通过 `dispatch --source 消息ID` 派发；忙碌成员的新任务按轮次排队，前一个任务交接或撤回后自动开放接单。面对“刚才那个也要支持键盘”，主控或任务所属成员可以对同一任务追加要求：
+
+```text
+coord amend-task --task-id ID --version 1 --source 消息ID --instructions "支持键盘操作" --completion "Tab 可聚焦，Enter 可导出"
+coord ack-task --task ID --ticket 凭据 --version 2
+coord handoff --task ID --ticket 凭据 --version 2 --report "已验证键盘操作" --paths 导出文件
+```
+
+`task_version` 表示任务要求版本，`ack_version` 表示成员已确认的版本。旧任务默认从 1 开始；已修改的任务在申请写入和交接时均须带上已确认的版本。成员仍可随时用 `yield` 交还写入资格。已交接任务再次调整时，保留任务 ID 和旧交接记录，开启新执行轮次，已有审查和依赖它的验收问题随之失效。主控使用 `change-goal` 处理影响整轮运行的目标变化。
+
+`say --source 消息ID --text 答复` 保存答复；增加 `--to 角色ID` 可将问题转给另一个角色。状态中包含最近对话和本人待处理的消息；`history --before 序号` 可查更早记录。`history --task-id ID --version N` 可复核指定版本的执行要求和验收条件。聊天内容中的批准仍须经过相应的既有决定流程。
+
 ### 常用 `coord` 命令
 
 > 运行 `coord help` 可查看最新格式。在未配写入权限的只读沙箱中调用任务命令时，请在命令中附带 `coord status` 返回的 `--task` 与 `--ticket`。
@@ -122,7 +138,7 @@ herdr-app do mod.open --name herdr-team-coordinator
 ## 本地开发自检与后台控制
 
 ```powershell
-# 运行全部 36 项单元测试与真实命名管道 CLI 集成测试（-B 避免生成 __pycache__）
+# 运行全部单元测试与真实命名管道 CLI 集成测试（-B 避免生成 __pycache__）
 python -B -X utf8 -m unittest discover -s . -v
 
 # 仅执行安装前打包与宿主静态检查（不修改已安装目录）
