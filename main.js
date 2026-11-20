@@ -35,7 +35,7 @@ async function findPython() {
       // Try the next registered launcher.
     }
   }
-  throw Error(configured ? "已配置的 Python 无法启动或低于 3.10。" : "未找到 Python 3.10 或更高版本。请运行安装脚本并指定 Python 路径。");
+  throw Error(configured ? "已配置的 Python 无法启动或低于 3.10。" : "未找到 Python 3.10 或更高版本。请将 Python 添加到 PATH，或在 Mod 目录的 python-path.json 中指定解释器路径。");
 }
 
 function button(t, id, title, action, tone = "normal") {

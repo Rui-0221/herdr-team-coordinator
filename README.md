@@ -39,8 +39,6 @@
 | --- | --- |
 | `mod.json` | Herdr 浮层 Mod 元数据定义（入口 `main.js` 与窗口尺寸） |
 | `main.js` | GPUI 前端控制与恢复面板（团队对话、运行概览、投递核对、高风险决定、写入回收、团队与角色配置） |
-| `install.ps1` | Windows 安装与静态检查脚本（校验 `herdr-app check`、写入 `python-path.json`、有序切换安装目录并配置沙箱读取 ACL） |
-| `coord.ps1` | PowerShell 包装入口，转发参数至 `coord.py` |
 | `coord.py` | 成员/本地 CLI 客户端与 `serve` 守护服务入口，包含请求防重暂存日志与凭据传递 |
 | `coordinator.py` | 协调器核心（SQLite 事务与迁移、终端绑定监控、`hc events` 唤醒、屏幕阻塞检测与安全自动投递、本地审批接口） |
 | `team_chat.py` | SQLite 团队对话记录（角色收件、引用与任务关联、历史分页、消息防重与处理结果） |
@@ -67,17 +65,12 @@
 
 ### 安装与打开
 
-在仓库根目录执行安装脚本（安装文件将复制到 `%USERPROFILE%\.config\herdr-app\mods\herdr-team-coordinator\`，升级前会先有序停止旧守护进程并将上一版本备份至安装暂存目录）：
+1. 在 Herdr App 的 `mods` 目录下创建 `herdr-team-coordinator`。默认路径为 `%USERPROFILE%\.config\herdr-app\mods\herdr-team-coordinator\`。设置了 `HERDR_APP_HOME` 时，使用该目录下的 `mods`。
+2. 将 `mod.json`、`main.js`、`coord.py`、`coordinator.py`、`supervisor.py`、`common.py`、`config_store.py`、`platform_runtime.py`、`team_chat.py`、`workflow.py`、`artifacts.py` 复制到该目录。升级前，先用已安装的 `coord.py local stop` 停止旧守护进程，再覆盖源码。
+3. 如需指定解释器，在 Mod 目录手动创建 `python-path.json`，内容形如 `{"python":"C:/Python314/python.exe"}`。默认依次尝试 `py.exe -3`、`python.exe` 和 `python3.exe`。
+4. 用 `herdr-app check <Mod 目录>` 检查文件，再运行 `herdr-app do mod.open --name herdr-team-coordinator` 打开面板。
 
-```powershell
-.\install.ps1
-herdr-app do mod.open --name herdr-team-coordinator
-```
-
-可选安装参数：
-- `-Python 'C:\路径\python.exe'`：显式指定 Python 3.10+ 解释器路径。
-- `-AppHome 'C:\自定义\herdr-app'`：覆盖默认 `%USERPROFILE%\.config\herdr-app`（也支持环境变量 `HERDR_APP_HOME`）。
-- `-CheckOnly`：仅复制非测试运行文件到临时目录并运行 `herdr-app check`，不改动正式安装目录也不启动守护进程。
+如果 Codex 的只读沙箱无法读取 Mod 目录，可为本机 `CodexSandboxUsers` 组授予 Mod 目录及其文件的读取和执行权限。`control/` 的访问权限由协调器单独管理。
 
 默认运行数据位于 `%USERPROFILE%\HerdrTeamCoordinator\`：
 - `control\coordinator.sqlite3`：中央状态数据库（严格属主隔离）
@@ -147,16 +140,16 @@ coord handoff --task ID --ticket 凭据 --version 2 --report "已验证键盘操
 # 运行全部单元测试与真实命名管道 CLI 集成测试（-B 避免生成 __pycache__）
 python -B -X utf8 -m unittest discover -s . -v
 
-# 仅执行安装前打包与宿主静态检查（不修改已安装目录）
-.\install.ps1 -CheckOnly
-herdr-app check "%USERPROFILE%\.config\herdr-app\mods\herdr-team-coordinator"
+# 检查已复制到默认安装目录的 Mod
+$mod = Join-Path $env:USERPROFILE '.config\herdr-app\mods\herdr-team-coordinator'
+herdr-app check $mod
 
 # 管理本机协调器后台进程（可追加 --root <目录> 指向独立测试数据目录）
-$coord = Join-Path $env:USERPROFILE '.config\herdr-app\mods\herdr-team-coordinator\coord.ps1'
-& $coord local status
-& $coord local start_daemon
-& $coord local stop
-& $coord local restart
+$coord = Join-Path $mod 'coord.py'
+python -B -X utf8 $coord local status
+python -B -X utf8 $coord local start_daemon
+python -B -X utf8 $coord local stop
+python -B -X utf8 $coord local restart
 ```
 
-`install.ps1 -CheckOnly` 与 `coord.ps1 local status` 均不会触发守护启动或初始化运行目录。守护进程空闲 5 分钟且无待处理任务/未完投递后自动有序退出，再次打开面板或收到有效 `coord` 请求时按需唤醒。
+`herdr-app check` 仅检查 Mod 加载，`coord.py local status` 查询后台状态。守护进程空闲 5 分钟且无待处理任务/未完投递后自动有序退出，再次打开面板或收到有效 `coord` 请求时按需唤醒。
