@@ -1,0 +1,6 @@
+{
+  "place": "none",
+  "title": "团队协调器",
+  "focusable": true,
+  "overlay": { "kind": "window", "key": "herdr-team-coordinator", "width": 880, "height": 690 }
+}

@@ -1,0 +1,42 @@
+# Python bytecode, caches & environments
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+
+# Herdr Team Coordinator runtime, database & staging artifacts
+python-path.json
+control/
+requests/
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+*.db
+*.log
+stage-*/
+backup-*/
+herdr-team-coordinator-install/
+
+# Secrets, local overrides & temporary files
+.env
+.env.*
+*.local.json
+*.tmp
+tmp/
+temp/
+
+# Editors & OS metadata
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+Thumbs.db
+Desktop.ini
+.DS_Store
