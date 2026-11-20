@@ -1,6 +1,6 @@
 # Herdr 团队协调器 (herdr-team-coordinator)
 
-面向 Windows 平台 [Herdr App](https://github.com/herdr) 与 `hc`（`herdr-core >= 0.1.21`）的多 Agent 团队协调器 Mod。在一个主控会话中完成目标拆解、派工、写锁仲裁、独立审查、版本变更与验收，并配合本地恢复面板处理人工核对和高风险审批。
+面向 Windows 平台 [Herdr App](https://github.com/herdr) 与 `hc`（`herdr-core >= 0.1.21`）的多 Agent 团队协调器 Mod。通过主控会话拆解目标、协调派工，也可直接与指定成员沟通，共用同一份团队对话、任务记录与验收条件。协调器负责写锁仲裁、版本变更与独立审查，本地恢复面板用于人工核对和高风险审批。
 
 支持协调 **Codex**、**Antigravity (`agy`)** 与 **DSH (`dsh` / `dst`)** 终端会话。
 
@@ -10,20 +10,22 @@
 
 ### 星型中枢与“数据面 / 唤醒面”分离
 
-所有成员都不直接互相发消息，全部协议状态由后台单实例守护进程 `Coordinator` 及其独占 SQLite 数据库（`control/coordinator.sqlite3`）统一维护：
+面板与成员终端统一通过后台单实例守护进程 `Coordinator` 交换消息和状态。团队对话、任务与协议状态均保存在其独占的 SQLite 数据库（`control/coordinator.sqlite3`）中。
 
 ```text
 [Agent A 终端] ──(1) coord.py 经 Windows 命名管道 (member)──▶ [Coordinator + SQLite]
                                                                     │
                               (2) hc events 监听 + hc send (<95B) ◀─┤ (短门铃唤醒)
                                                                     ▼
-[Agent B 终端] ◀──(3) coord status 经命名管道拉取完整任务与 inbox ──┘
+[Agent B 终端] ◀──(3) coord status 经命名管道拉取任务、对话与 inbox ─┘
        │
        └──(4) 成果留在项目 Git 工作区，由 artifacts.snapshot() 做 SHA-256 指纹校验
 ```
 
-- **数据面（结构化状态与完整正文）**：成员通过 `coord.py` 经 Windows 命名管道（`member` 通道）提交指令并从 `coord status` 读取完整 `candidates` 与未截断 `inbox`。每次请求校验 `binding + token`、`HC_TERMINAL_ID`、`hc` 实时终端 `instance` 以及任务轮次 `--task / --ticket`，并按目标 `revision` 做幂等防重。
+- **数据面（结构化状态与完整正文）**：成员通过 `coord.py` 经 Windows 命名管道（`member` 通道）提交指令并从 `coord status` 读取 `candidates`、`inbox`、近期团队对话 `conversation` 与当前角色的 `pending_messages`。每次请求校验 `binding + token`、`HC_TERMINAL_ID`、`hc` 实时终端 `instance` 以及任务轮次 `--task / --ticket`，并按目标 `revision` 做幂等防重。
 - **唤醒面（空闲会话低侵入叫醒）**：后台通过 `hc events` 监测终端状态；对插件创建并绑定的会话（`created_by_plugin=1` 且子成员启用 `--no-notify`），仅在终端处于 `idle` / `done` 且画面无弹窗、无草稿阻塞时发送不超过 95 字节的短唤醒提示（避免 Windows ConPTY 长文本粘贴丢回车），并结合 `SendResult.started`、状态轮询与精确前缀核验下的单次 `hc keys enter` 兜底确认；存量/手动绑定会话则保留在本地面板点击确认后再投递。
+- **共享对话与按角色派工**。面板消息和经 `say` 登记的终端消息统一写入 `team_messages`，记录收件角色、引用关系、任务与处理结果。主控可通过 `coord status` 读取成员职责、交付物与当前任务，用 `dispatch --source` 关联原消息并防止重复派工。成员已有执行项时，新任务按轮次排队。
+- **任务要求版本化与交接确认**。`amend-task` 更新单项任务的执行要求或验收条件，递增 `task_version` 并保留任务 ID。成员用 `ack-task` 确认新版后可申请写入或提交交接。已交接任务重新开启执行轮次时，已有审查及对应验收问题失效。
 - **排他写锁仲裁与阻塞追踪**：`workflow_grants` 与 FIFO `workflow_waits` 确保同一工作树或共享 Git `refs` 同时仅允许一个任务写入；支持通过 `blocked` 登记结构化阻塞依赖并在释放/交接后自动解除并通知等待方。
 - **强制独立只读审查与字节级指纹核验**：`_independent` 禁止使用任何曾持有写锁或提交过交接的会话执行审查；`review-start`、`review-submit`、`ask --purpose acceptance` 与 `answer` 均通过 `artifacts.snapshot()` 重新比对路径覆盖与 SHA-256 指纹，文件内容一旦变化即刻作废旧审查和旧问题。
 - **目标版本化、紧急暂停与崩溃恢复**：`change-goal` 递增目标 `revision` 并拦截旧版写入，由主控通过 `resolve-revision`（`reuse` / `adjust` / `cancel`）逐项处置旧任务；`pause --emergency` 可请求打断写入终端并冻结后续写权限；会话退出或后台重启后，可在本地面板重连/重绑并提交停写证据回收旧写入资格。
@@ -36,18 +38,19 @@
 | 文件 | 说明 |
 | --- | --- |
 | `mod.json` | Herdr 浮层 Mod 元数据定义（入口 `main.js` 与窗口尺寸） |
-| `main.js` | GPUI 前端控制与恢复面板（运行概览、投递核对、高风险决定、写入回收、团队与角色配置） |
+| `main.js` | GPUI 前端控制与恢复面板（团队对话、运行概览、投递核对、高风险决定、写入回收、团队与角色配置） |
 | `install.ps1` | Windows 安装与静态检查脚本（校验 `herdr-app check`、写入 `python-path.json`、有序切换安装目录并配置沙箱读取 ACL） |
 | `coord.ps1` | PowerShell 包装入口，转发参数至 `coord.py` |
 | `coord.py` | 成员/本地 CLI 客户端与 `serve` 守护服务入口，包含请求防重暂存日志与凭据传递 |
 | `coordinator.py` | 协调器核心（SQLite 事务与迁移、终端绑定监控、`hc events` 唤醒、屏幕阻塞检测与安全自动投递、本地审批接口） |
-| `workflow.py` | 工作流状态机（写锁 FIFO 仲裁、停写交接、版本变更、独立审查快照、`ask` / `answer` 决定与验收解绑） |
+| `team_chat.py` | SQLite 团队对话记录（角色收件、引用与任务关联、历史分页、消息防重与处理结果） |
+| `workflow.py` | 工作流状态机（任务级要求版本、写锁 FIFO 仲裁、停写交接、目标版本变更、独立审查快照、`ask` / `answer` 决定与验收解绑） |
 | `artifacts.py` | Git 工作树识别、范围重叠检测与基于 `git diff` / `ls-files` / 文件哈希的确定性成果快照 |
 | `platform_runtime.py` | 本机 CLI/模型/思考深度探测、`Hc` 适配封装、Windows 命名管道服务端/客户端与 ACL 安全描述符管理 |
 | `config_store.py` | 角色、团队与工具路径配置校验、持久化及旧版 `HerdrTeamManager` 配置预览/导入 |
 | `supervisor.py` | Windows 无窗口守护进程与 Job Object 监管重启控制 |
 | `common.py` | 公共异常 `DomainError`、时间戳、规范化 JSON 序列化与默认数据目录定位 |
-| `test_coordinator.py` | 协调器调度、自动投递、屏幕守卫、重绑复用及实管道 CLI 集成测试 |
+| `test_coordinator.py` | 共享对话、任务变更、协调器调度、自动投递、屏幕守卫、重绑复用及实管道 CLI 集成测试 |
 | `test_workflow.py` | 工作流写锁、阻塞、快照失效、版本复用、高风险授权及验收状态机单测 |
 | `test_platform_runtime.py` | Windows 命名管道隔离、并发锁、`Hc.send` 回执与 `Hc.launch` 启动参数单测 |
 | `README.md` | 项目说明、安装使用指南与权限边界文档 |
@@ -90,8 +93,9 @@ herdr-app do mod.open --name herdr-team-coordinator
 ### 启动一次团队协作
 1. 打开面板（`herdr-app do mod.open --name herdr-team-coordinator`），在「启动团队」选择**独立项目工作目录**、团队配置及验收方式（`chat` 或 `local`）。
 2. 选择已有终端会话或由协调器自动新建会话；手工绑定已有会话需将对应角色的接入指令粘贴至该终端运行一次 `coord status`。
-3. 首次在新项目目录拉起 Codex / Antigravity 交互会话时，若 CLI 弹出一次性「信任此文件夹」确认，请在对应终端标签页确认一次；随后主控会自动派工并推进整轮协作。
-4. 最终验收通过后，本轮全部活跃绑定会自动解绑（`active = 0`），终端可立即复用于下一轮任务。
+3. 首次在新项目目录拉起 Codex / Antigravity 交互会话时，若 CLI 弹出一次性「信任此文件夹」确认，请在对应终端标签页确认一次。
+4. 在运行页「团队对话」中向主控提出目标或补充条件，也可点选负责该任务的成员。通过「引用回复」沿用已有消息及其关联任务。
+5. 最终验收通过后，本轮全部活跃绑定会自动解绑（`active = 0`），终端可立即复用于下一轮任务。
 
 ### 与主控或指定成员对话
 
@@ -115,12 +119,14 @@ coord handoff --task ID --ticket 凭据 --version 2 --report "已验证键盘操
 
 | 阶段 | 命令与核对要点 |
 | --- | --- |
-| 查询状态 / 请求 | `coord status`（查询待办、写锁与完整 `inbox`）；`coord requests`（查询历史请求编号及入库结果） |
+| 查询状态 / 请求 | `coord status`（查询近期对话、待处理消息、执行项与写锁）、`coord requests`（查询历史请求编号及入库结果） |
+| 对话 / 历史 | `coord say --text ... [--to 角色ID] [--source 消息ID]` 登记消息、答复或转交，`coord history [--before 序号]` 分页查询 |
+| 调整单项任务 | `coord amend-task --task-id ID --version N [--instructions ...] [--completion ...]` 更新要求，成员使用 `coord ack-task --task ID --ticket 凭据 --version N` 确认当前版本 |
 | 派工 / 撤回 | 主控使用 `coord dispatch --role <id> --title ... --instructions ... --completion ... --mode read\|write [--optional]`；派错用 `coord cancel-task --task-id ID --reason ...` |
 | 接单与受阻 | 成员使用 `coord accept --task ID --ticket 凭据`；遇依赖阻塞执行 `coord blocked --reason ... [--depends-on-role \| --depends-on-task \| --depends-on-resource]` |
 | 申请写锁与交棒 | `coord request-write [--path 目录] [--repository-refs]`；停止写入后用 `coord yield`（交回资格但保留未完任务）或 `coord handoff --paths ... --json '{"evidence":...}'`（正式交接） |
 | 暂停与恢复 | `coord pause --reason ... [--emergency]` 冻结写入并按需请求打断写入终端；`coord resume [--task-id ID] [--json '{"evidence":...}']` 核对现场后恢复 |
-| 变更目标 | `coord change-goal --goal "新目标"` 递增目标版本；主控用 `coord resolve-revision --task-id ID --decision reuse\|adjust\|cancel --carried ...` 处理旧任务 |
+| 变更团队目标 | `coord change-goal --goal "新目标"` 递增目标版本；主控用 `coord resolve-revision --task-id ID --decision reuse\|adjust\|cancel --carried ...` 处理旧任务 |
 | 独立审查 | `coord review-start --role-id reviewer --paths ...` 对目标版本拍快照；审查员执行 `coord review-submit --review-id ID --verdict pass\|fail --report ...` |
 | 决定与验收 | `coord ask --purpose integration\|acceptance\|delete\|permission\|provider --text ...`；聊天验收下主控核实用户明确同意后执行 `coord answer --question-id ID --response yes\|no` |
 
