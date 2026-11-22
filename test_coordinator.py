@@ -151,8 +151,13 @@ class CoordinatorTests(unittest.TestCase):
         review = self.member('review-start', {'role_id':self.reviewer, 'paths':['out.txt']})['result']
         reviewer = self.member('status', role=self.reviewer)['result']['candidates'][0]
         r_ticket = {'task':review['task_id'], 'ticket':reviewer['ticket']}
+        submission = {**r_ticket, 'review_id':review['review_id'], 'verdict':'pass', 'report':'通过'}
+        self.assertIn('coord accept', reviewer['instructions'])
+        premature = self.member('review-submit', submission, self.reviewer)
+        self.assertFalse(premature['ok'])
+        self.assertIn('coord accept', premature['next'])
         self.member('accept', r_ticket, self.reviewer)
-        self.member('review-submit', {**r_ticket, 'review_id':review['review_id'], 'verdict':'pass', 'report':'通过'}, self.reviewer)
+        self.assertTrue(self.member('review-submit', submission, self.reviewer)['ok'])
         question = self.member('ask', {'purpose':'acceptance','text':'验收？'})['result']
         change = self.member('amend-task', {'task_id':task, 'instructions':'支持键盘', 'version':1})['result']
         self.assertEqual((change['task_id'], change['state']), (task, 'offered'))
@@ -212,6 +217,150 @@ class CoordinatorTests(unittest.TestCase):
         self.app.maintenance(inspect=False)
         self.assertEqual(len(self.core.attempts), 1)
         self.assertEqual(self.outbox(identifier)['state'], 'unknown')
+
+    def test_native_relay_cannot_change_target_role_or_call_local_actions(self):
+        with self.app.tx() as db:
+            db.execute("UPDATE bindings SET execution_mode='full_auto' WHERE id=?", (self.bindings[self.dev]['id'],))
+        direct = self.message('status', role=self.dev)
+        self.assertFalse(self.app.handle(direct, 'member')['ok'])
+        forged = {'action': 'status', 'params': {}, 'auth': self.message('status')['auth']}
+        relay = self.message('native-relay', forged, role=self.dev)
+        reply = self.app.handle(relay, 'member')
+        self.assertTrue(reply['ok'], reply)
+        self.assertEqual(reply['result']['role'], self.dev)
+        relay['params'] = {'action': 'service-stop', 'params': {}}
+        self.assertFalse(self.app.handle(relay, 'member')['ok'])
+        self.assertFalse(self.app.stop.is_set())
+
+    def test_native_worker_claims_outbox_without_calling_hc_send(self):
+        with self.app.tx() as db:
+            db.execute("UPDATE bindings SET execution_mode='full_auto' WHERE id=?", (self.bindings[self.dev]['id'],))
+        task, identifier = self.dispatch()
+        self.app.maintenance(inspect=False)
+        self.assertFalse(self.core.attempts)
+        outcome = self.member('native-next', role=self.dev)
+        self.assertTrue(outcome['ok'], outcome)
+        claim = outcome['result']
+        self.assertEqual(claim['id'], identifier)
+        self.assertEqual(self.outbox(identifier)['state'], 'sending')
+        self.assertEqual(self.member('native-next', role=self.dev)['result'], {})
+        self.assertFalse(self.app.handle(self.message('native-finish', {
+            'id': identifier, 'attempt': 'wrong', 'ok': True, 'evidence': 'wrong attempt',
+        }, self.dev), 'member')['ok'])
+        finished = self.member('native-finish', {
+            'id': identifier, 'attempt': claim['attempt'], 'ok': True, 'evidence': 'native done',
+        }, self.dev)
+        self.assertTrue(finished['ok'], finished)
+        self.assertEqual(self.outbox(identifier)['state'], 'delivered')
+        self.assertFalse(self.core.attempts)
+
+    def test_direct_user_directive_versions_task_and_survives_lead_replacement(self):
+        task, _ = self.dispatch()
+        chat = {'run_id': self.run, 'message_id': 'panel-lead', 'text': '请整理团队验收'}
+        self.app.local('say', chat)
+        direct = {'run_id': self.run, 'message_id': 'panel-worker', 'text': '页脚保留用户条款',
+                  'to': self.dev, 'task_id': task, 'version': 1}
+        updated = self.app.local('steer-task', direct)
+        self.assertEqual(self.app.local('steer-task', direct), updated)
+        self.assertEqual(updated['task_version'], 2)
+        self.assertFalse(self.member('amend-task', {'task_id': task, 'version': 1, 'instructions': '过期替换'})['ok'])
+        self.assertTrue(self.member('amend-task', {'task_id': task, 'version': 2, 'edit': 'replace',
+                                                   'instructions': '新版主控执行说明', 'source': 'panel-lead'})['ok'])
+        inspector = self.app.local('role-inspector', {'run_id': self.run, 'role_id': self.dev})
+        self.assertEqual(inspector['task']['instructions'], '新版主控执行说明')
+        self.assertEqual(inspector['task']['task_version'], 3)
+        self.assertEqual(inspector['task']['user_directives'][0]['text'], '页脚保留用户条款')
+        self.assertEqual([row['id'] for row in inspector['conversation']], ['panel-worker'])
+        snapshot = self.app.local('role-inspector', {'run_id': self.run, 'role_id': self.dev, 'task_id': task, 'version': 1})
+        self.assertEqual(snapshot['task']['instructions'], '先核对版本')
+        self.assertEqual(snapshot['task']['user_directives'], [])
+        status = self.member('status')['result']
+        self.assertIn('panel-worker', [row['id'] for row in status['conversation']])
+
+    def test_role_output_is_persisted_incrementally_and_keeps_role_scope(self):
+        with self.app.tx() as db:
+            db.execute("UPDATE bindings SET execution_mode='full_auto' WHERE id=?", (self.bindings[self.dev]['id'],))
+        _, identifier = self.dispatch()
+        turn = self.member('native-next', role=self.dev)['result']
+        trace = self.app.control / 'native-evidence' / self.bindings[self.dev]['id'] / f'{identifier}-{turn["attempt"]}.stdout.jsonl'
+        trace.parent.mkdir(parents=True)
+        trace.write_bytes(b'{"type":"text","text":"first"}\n{"type":"thinking","text":"hidden"}\n{"type":"tool')
+        params = {'run_id': self.run, 'role_id': self.dev, 'attempt': turn['attempt'], 'include_prompt': True}
+        first = self.app.local('role-output', params)
+        self.assertEqual([item['text'] for item in first['stdout']['events']], ['first'])
+        self.assertIn('先核对版本', first['prompt'])
+        with trace.open('ab') as sink:
+            sink.write(b'_result","result":"ticket=abcdef123456"}\n')
+        second = self.app.local('role-output', {**params, 'stdout_after': first['stdout']['next']})
+        self.assertEqual([item['text'] for item in second['stdout']['events']], ['ticket=[已隐藏]'])
+        forbidden = {**params, 'role_id': self.reviewer}
+        self.assertFalse(self.app.handle({'action': 'role-output', 'params': forbidden}, 'local')['ok'])
+        self.assertFalse(self.member('role-output', params, self.dev)['ok'])
+
+    def test_native_goal_change_settles_old_attempt_and_requeues_pending_role_chat(self):
+        with self.app.tx() as db:
+            db.execute("UPDATE bindings SET execution_mode='full_auto' WHERE id=?", (self.bindings['lead']['id'],))
+        self.app.local('say', {'run_id': self.run, 'message_id': 'goal-message', 'text': '更换团队目标'})
+        old = self.member('native-next')['result']
+        self.app.local('say', {'run_id': self.run, 'message_id': 'second-message', 'text': '仍要核对'})
+        relay = self.message('native-relay', {'action': 'change-goal', 'request_id': new_id(),
+                            'params': {'goal': '新目标', 'source': 'goal-message'}})
+        self.assertTrue(self.app.handle(relay, 'member')['ok'])
+        self.assertEqual(self.member('native-next')['result'], {})
+        receipt = {'id': old['id'], 'attempt': old['attempt'], 'ok': True, 'evidence': 'finished'}
+        self.assertEqual(self.member('native-finish', receipt)['result']['state'], 'obsolete')
+        self.assertIn('仍要核对', self.member('native-next')['result']['prompt'])
+
+    def test_status_recovers_unknown_chat_without_marking_business_action_complete(self):
+        msg = {'run_id': self.run, 'message_id': new_id(), 'text': '请核对要求'}
+        self.app.local('say', msg)
+        with self.app.tx(False) as db:
+            row = db.execute('SELECT id FROM outbox WHERE chat_id=?', (msg['message_id'],)).fetchone()
+        identifier = row['id']
+        self.app.approve_delivery({'run_id': self.run, 'delivery_id': identifier})
+        self.core.send_outcome = {'status': 'unknown', 'evidence': 'Connection lost'}
+        self.app.deliver(identifier)
+        self.assertEqual(self.outbox(identifier)['state'], 'unknown')
+        result = self.member('status')['result']
+        self.assertIn(msg['message_id'], [message['id'] for message in result['pending_messages']])
+        self.assertEqual(self.outbox(identifier)['state'], 'observed')
+        self.assertTrue(self.member('say', {'source': msg['message_id'], 'text': '收到'})['ok'])
+
+    def test_paused_run_holds_chat_and_version_ack_consumes_only_update(self):
+        task, offer = self.dispatch()
+        ticket = self.task_ticket(task)
+        self.assertTrue(self.member('accept', ticket, self.dev)['ok'])
+        self.assertTrue(self.member('amend-task', {'task_id': task, 'version': 1, 'completion': '更多要求'})['ok'])
+        with self.app.tx(False) as db:
+            update = db.execute('SELECT id FROM outbox WHERE task_id=? AND task_version=2', (task,)).fetchone()['id']
+        self.assertTrue(self.member('ack-task', {**ticket, 'version': 2}, self.dev)['ok'])
+        self.assertEqual(self.outbox(update)['state'], 'observed')
+        self.assertEqual(self.outbox(offer)['state'], 'delivered')
+        self.app.local('pause', {'run_id': self.run, 'reason': '暂停'})
+        self.app.local('say', {'run_id': self.run, 'message_id': new_id(), 'text': '恢复后处理'})
+        with self.app.tx(False) as db:
+            chat = db.execute("SELECT id FROM outbox WHERE kind='chat'").fetchone()['id']
+        self.app.maintenance(inspect=False)
+        self.assertEqual(self.outbox(chat)['state'], 'queued')
+        self.assertFalse(self.core.attempts)
+
+    def test_managed_restart_rekeys_failed_session_and_retains_task(self):
+        task, _ = self.dispatch()
+        ticket = self.task_ticket(task)
+        self.assertTrue(self.member('accept', ticket, self.dev)['ok'])
+        old = self.bindings[self.dev]
+        self.core.terminals[old['terminal']]['state'] = 'finished'
+        result = self.app.local('restart_managed', {'run_id': self.run, 'binding_id': old['id']})
+        self.assertEqual(result['state'], 'pending')
+        self.assertFalse(self.member('status', role=self.dev)['ok'])
+        self.app.launch_binding(result['id'])
+        with self.app.tx(False) as db:
+            self.bindings[self.dev] = dict(self.app.get_binding(db, result['id']))
+        self.assertTrue(self.bindings[self.dev]['created_by_plugin'])
+        self.assertNotEqual(old['token'], self.bindings[self.dev]['token'])
+        replacement = self.task_ticket(task)
+        self.assertNotEqual(ticket, replacement)
+        self.assertTrue(self.member('accept', replacement, self.dev)['ok'])
 
     def test_repeated_accept_uses_member_receipt(self):
         task, identifier = self.dispatch()

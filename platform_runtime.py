@@ -47,7 +47,7 @@ def resolve_tools(config=None):
         "hc": ("hc.exe", "hc", local / "Programs/herdr-core/hc.exe"),
         "herdr-app": ("herdr-app.exe", "herdr-app", local / "Programs/herdr-app/herdr-app.exe"),
         "codex": ("codex.cmd", "codex.exe", "codex", roaming / "npm/codex.cmd"),
-        "dsh": ("dst.exe", "dst.cmd", "dsh.exe", "dsh.cmd", roaming / "npm/dst.cmd"),
+        "dsh": (local / "dsh-cli/dsh.cmd", roaming / "npm/dsh-tui.cmd", "dsh-tui.cmd", "dsh-tui"),
         "antigravity": ("agy.exe", "agy", "antigravity.exe", local / "agy/bin/agy.exe"),
     }
     tools = {}
@@ -186,7 +186,7 @@ class HcError(RuntimeError):
 
 
 def launch_hidden(args, *, cwd=None, env=None, stdout=None, stderr=None, breakaway=False):
-    """Start without a console or inherited handles. A disallowed breakaway is retried once."""
+    """Start without a console or inherited handles."""
     flags = CREATE_NO_WINDOW | (BREAKAWAY_FROM_JOB if breakaway and os.name == "nt" else 0)
     options = dict(cwd=cwd, env=env, stdin=subprocess.DEVNULL,
                    stdout=subprocess.DEVNULL if stdout is None else stdout,
@@ -196,7 +196,17 @@ def launch_hidden(args, *, cwd=None, env=None, stdout=None, stderr=None, breakaw
     except OSError as exc:
         if not breakaway or getattr(exc, "winerror", None) != 5:
             raise
+        logging.getLogger(__name__).warning(
+            "Windows Job refused breakaway. The supervisor may be stopped by the caller's Job."
+        )
         return subprocess.Popen(args, creationflags=CREATE_NO_WINDOW, **options)
+
+
+def prompt_lines(screen):
+    if not isinstance(screen, dict) or not screen.get("complete", True):
+        return []
+    raw = screen.get("text")
+    return [line.strip() for line in raw.splitlines() if line.strip()] if isinstance(raw, str) else []
 
 
 class Hc:
@@ -379,6 +389,13 @@ class Hc:
             if effort != "default":
                 argv += ["--effort", effort]
             argv += ["--prompt-interactive=" + bootstrap]
+        return self._run_terminal(argv, cwd, name, labels, env, parent, no_notify)
+
+    def launch_worker(self, python, script, *, cwd, name, labels, environment, parent):
+        return self._run_terminal([python, '-B', '-X', 'utf8', str(script)], cwd, name, labels,
+                                  environment, parent, True)
+
+    def _run_terminal(self, argv, cwd, name, labels, env, parent, no_notify):
         params = {"argv": argv, "cwd": str(Path(cwd).resolve()), "env": env,
                   "name": name, "labels": labels, "no_parent": not parent,
                   "outlive_parent": bool(parent), "no_notify": bool(parent and no_notify)}
@@ -396,27 +413,41 @@ class Hc:
         return self._call("keys", "--", address, *key_names, timeout=timeout)
 
     @staticmethod
-    def _prompt_holds_marker(screen, marker):
+    def _prompt_holds_marker(screen, marker, text):
         """Return True only when the active bottom prompt line holds our unsubmitted marker."""
-        if not marker or not isinstance(screen, dict) or not screen.get("complete", True):
+        if (not marker or not isinstance(screen, dict) or not screen.get("complete", True)
+                or screen.get("how", "screen") != "screen"):
             return False
         raw = screen.get("text")
         if not isinstance(raw, str) or not raw.strip():
             return False
-        tail = [line.rstrip() for line in raw.splitlines() if line.strip()][-10:]
+        # Preserve blank lines so a multiline draft is distinguishable from the footer.
+        tail = raw.rstrip().splitlines()[-18:]
         tail_lower = "\n".join(tail).lower()
         if any(tok in tail_lower for tok in ("enter select", "enter continue", "enter confirm", "esc back", "esc to cancel")):
             return False
-        prompts = [idx for idx, line in enumerate(tail) if line.lstrip().startswith(("›", ">"))]
+        prompts = [idx for idx, line in enumerate(tail) if line.lstrip().startswith(("»", "›", ">"))]
         if not prompts:
             return False
         last_idx = prompts[-1]
-        if any(line.lstrip().startswith(("•", "Ran ")) for line in tail[last_idx + 1:]):
-            return False
-        compact_prompt = re.sub(r"\s+", "", "".join(tail[last_idx:]))
-        return re.sub(r"\s+", "", marker) in compact_prompt
+        prompt = tail[last_idx].lstrip()[1:].strip()
+        separated = False
+        for line in tail[last_idx + 1:]:
+            part = line.strip()
+            if not part:
+                separated = True
+                continue
+            if (part.startswith(("GPT-", "← for agents", "? for shortcuts", "New activity ·", "enter/esc latest"))
+                    or set(part) <= {"─", "-"}):
+                break
+            if separated or part.startswith(("•", "Ran ")) or not line[:1].isspace():
+                return False
+            prompt += part
+        # Core may render a soft wrap at a space or between double-width characters.
+        compact = lambda value: re.sub(r"\s+", "", value)
+        return text.startswith(marker) and compact(prompt) == compact(text)
 
-    def _poll_turn_start(self, address, expected, turn_at_send, polls):
+    def _poll_turn_start(self, address, expected, before, polls):
         after = None
         for idx in range(max(0, polls) + 1):
             if idx and self._confirm_interval > 0:
@@ -428,7 +459,9 @@ class Hc:
                 continue
             if not after or after["instance"] != expected or after["state"] != "live":
                 return False, after
-            if after.get("status") == "working" or (type(turn_at_send) is int and after.get("turn", -1) > turn_at_send):
+            old_turn, new_turn = before.get("turn"), after.get("turn")
+            if ((before.get("status") != "working" and after.get("status") == "working") or
+                    (type(old_turn) is int and type(new_turn) is int and new_turn > old_turn)):
                 return True, after
         return False, after
 
@@ -473,38 +506,36 @@ class Hc:
                 after = None
             if not after or after["instance"] != expected or after["state"] != "live":
                 return {"status": "unknown", "evidence": {"receipt": answer, "reason": "发送后终端实例已变化或退出。"}}
-            if type(turn_at_send) is not int or after.get("turn", -1) < turn_at_send:
+            if type(turn_at_send) is not int or type(after.get("turn")) is not int or after["turn"] < turn_at_send:
                 return {"status": "unknown", "evidence": {"receipt": answer, "reason": "发送轮次与当前终端不匹配。"}}
             return {"status": "delivered", "evidence": answer}
-        confirmed, after = self._poll_turn_start(address, expected, turn_at_send, self._confirm_polls)
+        confirmed, after = self._poll_turn_start(address, expected, before, self._confirm_polls)
         if confirmed:
             return {"status": "delivered", "evidence": {**answer, "confirmed_status": after.get("status"), "confirmed_turn": after.get("turn")}}
         # If ConPTY bracketed paste left our exact message unsubmitted in the prompt box, press Enter once.
-        if started is False and confirm_marker and after and after.get("status") in ("idle", "done"):
+        if (started is False and confirm_marker and after and after.get("instance") == expected
+                and after.get("state") == "live" and after.get("status") in ("idle", "done")):
             try:
                 screen = self.read(address, lines=0)
             except (OSError, HcError, subprocess.TimeoutExpired):
                 screen = None
-            if self._prompt_holds_marker(screen, confirm_marker):
+            if self._prompt_holds_marker(screen, confirm_marker, text):
                 try:
+                    current = self.terminal(address)
+                    if (not current or current.get("instance") != expected or current.get("state") != "live"
+                            or current.get("status") != after.get("status") or current.get("turn") != after.get("turn")):
+                        return {"status": "unknown", "evidence": "补回车前终端状态已变化。"}
                     self.keys(address, "enter")
                 except (OSError, HcError, subprocess.TimeoutExpired):
                     pass
                 else:
-                    confirmed_key, after_key = self._poll_turn_start(address, expected, turn_at_send, max(4, self._confirm_polls))
+                    confirmed_key, after_key = self._poll_turn_start(address, expected, before, max(4, self._confirm_polls))
                     if confirmed_key:
                         return {"status": "delivered", "evidence": {**answer, "confirmed_via": "keys_enter",
                                                                     "confirmed_status": after_key.get("status"),
                                                                     "confirmed_turn": after_key.get("turn")}}
-                    after = after_key
         if started is False:
             return {"status": "unknown", "evidence": {**answer, "reason": "消息可能停留在输入框，未观察到 Agent 开始处理。"}}
-        if not after or after["instance"] != expected or after["state"] != "live":
-            return {"status": "unknown", "evidence": {"receipt": answer, "reason": "发送后终端实例已变化或退出。"}}
-        if type(turn_at_send) is not int or after.get("turn", -1) < turn_at_send:
-            return {"status": "unknown", "evidence": {"receipt": answer, "reason": "发送轮次与当前终端不匹配。"}}
-        if type(before.get("turn")) is int and after.get("turn", -1) > before["turn"]:
-            return {"status": "delivered", "evidence": answer}
         return {"status": "unknown", "evidence": {"receipt": answer, "reason": "终端未报告开始处理状态，投递结果待核实。"}}
 
     def events(self, wake, stop, *, labels=None, terminal=None):

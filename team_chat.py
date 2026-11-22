@@ -18,12 +18,15 @@ def install(db):
     """)
 
 
-def page(db, run_id, *, before=None, limit=16, pending_for=None, revision=None, task_id=None):
+def page(db, run_id, *, before=None, limit=16, pending_for=None, revision=None, task_id=None, participant=None):
     query = 'SELECT seq,id,revision,sender,origin,recipient,text,task_id,reply_to,result,created FROM team_messages WHERE run_id=?'
     args = [run_id]
     if task_id is not None:
         query += ' AND task_id=?'
         args.append(task_id)
+    if participant is not None:
+        query += ' AND (recipient=? OR sender=?)'
+        args.extend((participant, participant))
     if before is not None:
         if type(before) is not int:
             raise DomainError('无效的历史游标')
@@ -71,12 +74,15 @@ def record(db, run, sender, origin, params, enqueue, *, outcome=None):
     task_id = params.get('task_id') or (parent['task_id'] if parent else None)
     if task_id and not db.execute('SELECT 1 FROM tasks WHERE id=? AND run_id=?', (task_id, run['id'])).fetchone():
         raise DomainError('关联任务不在当前团队')
+    if origin == 'panel' and params.get('to') and task_id and target['kind'] != 'master' and not db.execute(
+            'SELECT 1 FROM tasks WHERE id=? AND role_id=?', (task_id, target['role_id'])).fetchone():
+        raise DomainError('消息目标与任务角色不匹配')
     db.execute('''INSERT INTO team_messages(run_id,id,revision,sender,origin,recipient,text,task_id,reply_to,input_hash,result,created)
                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?)''',
                (run['id'], identifier, run['revision'], sender, origin, target['role_id'], text.strip(), task_id,
                 parent['id'] if parent else None, fingerprint, wire(outcome) if outcome else None, now()))
     if target['role_id'] != sender or origin == 'panel':
-        enqueue(db, run, target['id'], 'chat', f'团队对话 {identifier} 有更新，请查看 coord status。')
+        enqueue(db, run, target['id'], 'chat', f'团队对话 {identifier} 有更新，请查看 coord status。', chat_id=identifier)
     return {'message_id': identifier}
 
 

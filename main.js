@@ -16,8 +16,11 @@ const statusLabels = {
   live: "可用", bound: "已绑定", launched: "已启动", offered: "待接单", yielded: "已让权",
   handed_off: "已交接", obsolete: "已撤销", historic: "已归档", delivered: "已投递", needs_decision: "旧任务待处理",
   awaiting_bind: "待绑定已有会话", stale_delivery: "旧投递待核对", retrying: "等待重启", detached: "调度器运行中", starting: "正在启动",
+  preparing: "正在准备启动", launch_failed: "启动失败", observed: "成员已读取",
 };
 const label = value => statusLabels[value] ?? value ?? "待查询";
+const executionLabel = value => value === "full_auto" ? "Windows 隔离 · 完全放权" :
+  value === "approval" ? "Windows 隔离 · 受限沙箱" : "存量交互模式";
 const rows = value => Array.isArray(value) ? value : [];
 const pathPart = () => `${appHome().replaceAll("\\", "/")}/mods/${MOD}`;
 const plain = value => typeof value === "object" && value !== null ? JSON.stringify(value) : String(value ?? "");
@@ -87,6 +90,9 @@ export default class TeamCoordinator extends View {
     this.chatTarget = "";
     this.chatReply = null;
     this.chatAttempt = null;
+    this.roleDraft = TextareaState.new({ placeholder: "给当前角色发送消息", rows: 2 });
+    this.roleView = null;
+    this.roleAttempt = null;
     this.goal = TextareaState.new({ placeholder: "希望团队完成什么？", rows: 4 });
     this.criteria = TextareaState.new({ placeholder: "可选，例如必须完成的交付物或测试", rows: 2 });
     this.project = InputState.new({ placeholder: "本机项目目录", value: focused()?.cwd ?? "" });
@@ -111,6 +117,15 @@ export default class TeamCoordinator extends View {
           this.setDashboard(await this.api("dashboard", { run_id: this.selectedRun, before: this.chatBefore }));
         }
       }, true);
+    });
+    cx.timer.every(2500, cx => {
+      if (this.page !== "role" || !this.roleView || this.roleLoading || this.busy) return;
+      this.roleLoading = true;
+      cx.spawn(async cx => {
+        try { await this.reloadRole(); }
+        catch (error) { this.roleError = String(error.message ?? error); }
+        finally { this.roleLoading = false; cx.notify(); }
+      });
     });
   }
 
@@ -145,8 +160,70 @@ export default class TeamCoordinator extends View {
   }
 
   async reload() {
+    if (this.page === "role") return this.reloadRole();
     this.setDashboard(await this.api("dashboard", { run_id: this.selectedRun, before: this.chatBefore }));
     this.background = await this.api("status");
+  }
+
+  openRole(cx, run, member) {
+    this.roleView = { run_id: run.id, role_id: member.role_id, events: [], diagnostics: [] };
+    this.roleDraft.set_value("");
+    this.roleAttempt = null;
+    this.roleError = "";
+    this.page = "role";
+    this.job(cx, () => this.reloadRole());
+  }
+
+  async reloadRole() {
+    const view = this.roleView;
+    if (!view) return;
+    const { run_id, role_id, task_id, version, before } = view;
+    const detail = await this.api("role-inspector", { run_id, role_id, task_id, version, before });
+    if (this.roleView !== view || view.task_id !== task_id || view.version !== version || view.before !== before) return;
+    view.detail = detail;
+    this.roleError = "";
+    const attempt = view.selectedTurn || detail.turns[0]?.attempt;
+    if (attempt !== view.attempt) {
+      view.attempt = attempt;
+      view.stderr_after = view.stdout_after = undefined;
+      view.events = [];
+      view.diagnostics = [];
+      view.prompt = "";
+    }
+    if (!attempt && detail.role.execution_mode !== "legacy") return;
+    const selection = view.selectedTurn;
+    const output = await this.api("role-output", { run_id, role_id, attempt,
+      stdout_after: view.stdout_after, stderr_after: view.stderr_after, include_prompt: !view.prompt });
+    if (this.roleView !== view || view.selectedTurn !== selection || view.attempt !== attempt) return;
+    view.screen = output.screen;
+    if (output.stdout) {
+      view.stdout_after = output.stdout.next;
+      view.stderr_after = output.stderr.next;
+      view.events = [...view.events, ...output.stdout.events].slice(-160);
+      view.diagnostics = [...view.diagnostics, ...output.stderr.events].slice(-40);
+    }
+    if (output.prompt) view.prompt = output.prompt;
+  }
+
+  sendRole(cx, directive) {
+    this.job(cx, async () => {
+      const view = this.roleView;
+      const value = this.roleDraft.value().trim();
+      if (!view?.detail || !value) return;
+      const { run_id, role_id } = view;
+      const task = view.detail.task;
+      const body = { run_id, to: role_id, text: value };
+      if (directive) Object.assign(body, { task_id: task.id, version: task.task_version });
+      const key = JSON.stringify(body);
+      if (this.roleAttempt?.key !== key) this.roleAttempt = { key, id: `role-${Date.now()}-${Math.random().toString(36).slice(2)}` };
+      const result = await this.api(directive ? "steer-task" : "say", { ...body, message_id: this.roleAttempt.id });
+      if (view !== this.roleView) return;
+      if (this.roleDraft.value().trim() === value) this.roleDraft.set_value("");
+      this.roleAttempt = null;
+      view.version = view.before = undefined;
+      this.message = directive ? `已记录任务第 ${result.task_version} 版，等待角色确认。` : "消息已进入角色信箱。";
+      await this.reloadRole();
+    });
   }
 
   setDashboard(data) {
@@ -186,7 +263,7 @@ export default class TeamCoordinator extends View {
     const state = status?.running ? "running" : status?.phase ?? "unknown";
     const detail = status?.scheduler_pid ?? status?.pid;
     return h_flex().min_h(42).items_center().justify_between().gap(10).px(14).py(5).bg(t.chrome)
-      .child(hint(t, `后台 ${label(state)}${detail ? ` · ${detail}` : ""}${status?.supervisor_pid ? ` · 监督 ${status.supervisor_pid}` : ""}`).truncate())
+      .child(hint(t, `后台 ${label(state)}${detail ? ` · ${detail}` : ""}${status?.supervisor_pid ? ` · 监督 ${status.supervisor_pid}` : ""}${status?.guarded_by_job ? " · 依附启动进程" : ""}`).truncate())
       .child(actions()
         .child(button(t, "background-start", "启动后台", this.busy ? null : (_e, cx) => this.command(cx, "start_daemon", {}, "已请求启动后台。")))
         .child(button(t, "background-stop", "停止后台", this.busy ? null : (_e, cx) => this.job(cx, async () => {
@@ -228,11 +305,13 @@ export default class TeamCoordinator extends View {
     const statusParts = [
       terminal,
       member.provider ?? member.agent,
+      executionLabel(member.execution_mode),
       label(member.launch_state),
       member.health && member.health !== "unknown" ? label(member.health) : null,
       member.terminal_status ? label(member.terminal_status) : null,
     ].filter(Boolean);
     return item(t, `${memberName} · ${roleLabels[role] ?? plain(role)}`)
+      .child(actions().child(button(t, `inspect-${bindingID}`, "打开角色", (_e, cx) => this.openRole(cx, runData, member))))
       .child(hint(t, statusParts.join(" · ")))
       .when(Boolean(member.launch_evidence), row => row.child(hint(t, member.launch_evidence)))
       .child(actions()
@@ -312,12 +391,15 @@ export default class TeamCoordinator extends View {
 
   rebindPicker(t, runData, binding, master) {
     const candidate = this.expanded.recover.term;
+    const native = binding.execution_mode && binding.execution_mode !== "legacy";
+    const canRestart = (native || binding.provider !== "dsh") && (["uncertain", "launch_failed"].includes(binding.launch_state) ||
+      (binding.terminal && !rows(this.data?.terminals).some(term => terminalInstance(term) === binding.instance)));
     const busyTerminals = new Set(rows(this.data.runs)
       .filter(row => row.state !== "accepted")
       .flatMap(row => rows(row.bindings))
       .filter(member => member.active !== 0 && member.id !== binding.id && member.terminal)
       .map(member => member.terminal));
-    const terminals = rows(this.data?.terminals).filter(term => terminalInstance(term) && terminalAddress(term) &&
+    const terminals = rows(this.data?.terminals).filter(term => !native && terminalInstance(term) && terminalAddress(term) &&
       term.state === "live" && (!binding.provider || terminalAgent(term) === binding.provider) &&
       !busyTerminals.has(terminalAddress(term)) && !(term.labels?.["team.run"]));
     const choices = actions();
@@ -326,16 +408,29 @@ export default class TeamCoordinator extends View {
     }, candidate && terminalInstance(candidate) === terminalInstance(term) ? "selected" : "normal"));
     const content = v_flex().gap(8);
     if (!terminals.length) content.child(hint(t, "当前找不到能核验实例的同类会话。可在项目目录启动 CLI 后刷新。"));
+    if (canRestart) content.child(button(t, "restart-managed", "创建新的受管会话", this.busy ? null : (_e, cx) =>
+      this.command(cx, "restart_managed", { run_id: runData.id, binding_id: binding.id }, () => {
+        this.expanded.recover = null;
+        this.expanded.bootstrap = null;
+        return "已安排启动。请查看新会话与任务续接状态。";
+      })));
     return content.child(choices).child(actions()
       .child(button(t, "recover-cancel", "取消", (_e, cx) => { this.expanded.recover = null; cx.notify(); }))
       .child(button(t, "recover-confirm", master ? "确认绑定并恢复主控" : "确认绑定成员", candidate && !this.busy ? (_e, cx) => this.command(cx,
       master ? "rebind_lead" : "rebind_member", {
         run_id: runData.id, binding_id: binding.id, terminal: terminalAddress(candidate), instance: terminalInstance(candidate),
+        auto_push: this.expanded.recover.autoPush === true,
       }, () => {
         this.expanded.recover = null;
         this.expanded.bootstrap = null;
         return "已绑定会话。请获取该会话的配对指令。";
-      }) : null, "primary")));
+      }) : null, "primary"))
+      .child(button(t, "recover-auto-push",
+        this.expanded.recover.autoPush ? "配对后自动推送 · 已开启" : "配对后自动推送 · 已关闭",
+        candidate && !this.busy ? (_e, cx) => {
+          this.expanded.recover.autoPush = !this.expanded.recover.autoPush;
+          cx.notify();
+        } : null)));
   }
 
   renderChat(t, current) {
@@ -505,6 +600,91 @@ export default class TeamCoordinator extends View {
     return panel;
   }
 
+  renderRole(t) {
+    const view = this.roleView;
+    const panel = v_flex().gap(14).child(actions().child(button(t, "role-back", "返回团队", (_e,cx) => {
+      this.page = "runs";
+      this.job(cx, () => this.reload());
+    })));
+    const detail = view?.detail;
+    if (!detail) return panel.child(hint(t, this.roleError || "正在读取角色…"));
+    const { role, run, task, tasks, grants, turns, conversation, summary, handoffs } = detail;
+    const holds = grants.filter(grant => grant.released == null);
+    panel.child(heading(t, role.name || role.role_id))
+      .child(hint(t, [role.role_id, role.provider, role.model, executionLabel(role.execution_mode),
+        label(role.terminal_status || role.health), holds.length ? `持有 ${holds.length} 项写锁` : "无活跃写锁"].join(" · ")));
+    if (this.roleError) panel.child(hint(t, this.roleError));
+    if (holds.length) panel.child(v_flex().children(holds.map(lock => hint(t, lock.path))));
+    const context = group(t, "角色上下文").child(text(t, run.goal));
+    if (role.duties) context.child(hint(t, role.duties));
+    if (summary) context.child(text(t, summary));
+    panel.child(context);
+    const assignment = group(t, "任务与交接");
+    if (tasks.length) assignment.child(actions().children(tasks.map(row => button(t, `role-task-${row.id}`,
+      `${row.title} · ${label(row.state)}`, (_e,cx) => {
+        view.task_id = row.id;
+        view.version = undefined;
+        this.job(cx, () => this.reloadRole());
+      }, task?.id === row.id ? "selected" : "normal"))));
+    if (task) {
+      const current = tasks.find(row => row.id === task.id);
+      assignment.child(hint(t, `${task.id} · 第 ${task.round} 轮 · 第 ${task.task_version} 版 · 已确认第 ${task.ack_version} 版`))
+        .child(text(t, task.instructions)).child(hint(t, "验收条件")).child(text(t, task.completion));
+      for (const directive of task.user_directives) {
+        assignment.child(item(t, `用户要求 · 第 ${directive.version} 版`).child(text(t, directive.text)));
+      }
+      if (current?.task_version > 1) assignment.child(actions().children([
+        button(t, "role-task-earlier", "上一版", task.task_version > 1 ? (_e,cx) => {
+          view.task_id = task.id; view.version = task.task_version - 1;
+          this.job(cx, () => this.reloadRole());
+        } : null),
+        button(t, "role-task-current", "当前版本", view.version ? (_e,cx) => {
+          view.version = undefined; this.job(cx, () => this.reloadRole());
+        } : null),
+      ]));
+      for (const handoff of handoffs.filter(row => row.task_id === task.id)) assignment.child(item(t, label(handoff.kind)).child(text(t, handoff.report)));
+    } else assignment.child(hint(t, "暂无派工记录。"));
+    panel.child(assignment);
+
+    const chat = group(t, `与 ${role.name || role.role_id} 对话`);
+    for (const msg of conversation) chat.child(item(t, `${msg.sender} → ${msg.recipient} · ${date(msg.created)}`).child(text(t, msg.text)));
+    if (conversation.length === 12 || view.before) chat.child(actions().children([
+      button(t, "role-chat-older", "更早消息", conversation.length === 12 ? (_e,cx) => {
+        view.before = conversation[0].seq; this.job(cx, () => this.reloadRole());
+      } : null),
+      button(t, "role-chat-latest", "最新消息", view.before ? (_e,cx) => {
+        view.before = undefined; this.job(cx, () => this.reloadRole());
+      } : null),
+    ]));
+    if (run.state !== "accepted") {
+      const canAmend = task && !view.version && role.kind === "member" && run.state === "active" &&
+        task.revision === run.revision && ["queued", "offered", "accepted", "blocked", "yielded", "handed_off"].includes(task.state);
+      chat.child(this.field(t, "消息", this.roleDraft, true, 68)).child(actions().children([
+        button(t, "role-chat-send", "发送消息", this.busy ? null : (_e,cx) => this.sendRole(cx, false), "primary"),
+        button(t, "role-chat-directive", "记录为任务要求", this.busy || !canAmend ? null : (_e,cx) => this.sendRole(cx, true)),
+      ]));
+    }
+    panel.child(chat);
+
+    const work = group(t, "工作流输出");
+    if (turns.length) work.child(actions().children([
+      button(t, "role-turn-live", "跟随最新回合", (_e,cx) => {
+        view.selectedTurn = undefined; this.job(cx, () => this.reloadRole());
+      }, view.selectedTurn ? "normal" : "selected"),
+      ...turns.map(turn => button(t, `role-turn-${turn.attempt}`, `${date(turn.created)} · ${label(turn.state)}`,
+        (_e,cx) => { view.selectedTurn = turn.attempt; this.job(cx, () => this.reloadRole()); },
+        view.selectedTurn === turn.attempt ? "selected" : "normal")),
+    ]));
+    if (view.prompt) work.child(button(t, "role-show-prompt", view.showPrompt ? "收起引擎输入" : "查看引擎输入", (_e,cx) => {
+      view.showPrompt = !view.showPrompt; cx.notify();
+    })).when(view.showPrompt, el => el.child(text(t, view.prompt)));
+    if (view.screen) work.child(text(t, view.screen));
+    for (const event of view.events) work.child(item(t, event.name || event.kind).child(text(t, event.text)));
+    if (view.diagnostics.length) work.child(hint(t, "引擎诊断")).children(view.diagnostics.map(event => text(t, event.text)));
+    if (!view.screen && !view.events.length && !view.diagnostics.length) work.child(hint(t, "等待角色输出。"));
+    return panel.child(work);
+  }
+
   renderStart(t) {
     if (!this.project) return v_flex();
     const config = this.data?.config;
@@ -527,11 +707,16 @@ export default class TeamCoordinator extends View {
       if (directory) this.project.set_value(directory);
     }))).child(this.field(t, "目标", this.goal, true, 90)).child(this.field(t, "完成条件", this.criteria, true, 60));
     for (const member of rows(selected.members)) {
+      const native = member.execution_mode && member.execution_mode !== "legacy";
       const current = this.launchMembers[member.id];
       const terminalsForMember = terminals.filter(term => terminalInstance(term) && term.state === "live" && term.status !== "working" &&
         member.agent === terminalAgent(term) && !alreadyBound.has(terminalAddress(term)) && !term.labels?.["team.run"]);
       const row = item(t, `${roles.get(member.role)?.name ?? member.id} · ${member.agent} / ${member.model}`)
-        .child(hint(t, `${member.write_allowed ? "已启用写入资格申请" : "协调器写入申请关闭"} · ${member.effort === "default" ? "CLI 默认思考强度" : member.effort}`));
+        .child(hint(t, `${executionLabel(member.execution_mode)} · ${member.write_allowed ? "可申请写入" : "协议只读"}`));
+      if (native) {
+        content.child(row);
+        continue;
+      }
       const choices = actions().child(button(t, `new-${member.id}`, member.agent === "dsh" ? "稍后绑定" : "新建会话", (_e, cx) => {
         delete this.launchMembers[member.id]; cx.notify();
       }, !current ? "selected" : "normal"));
@@ -556,7 +741,9 @@ export default class TeamCoordinator extends View {
       const criteria = this.criteria.value().trim();
       const result = await this.api("start", {
         team_id: selected.id, project, goal: criteria ? `${goal}\n\n完成条件\n${criteria}` : goal, acceptance,
-        members: Object.fromEntries(Object.entries(this.launchMembers).map(([id, term]) => [id, {
+        members: Object.fromEntries(Object.entries(this.launchMembers)
+          .filter(([id]) => rows(selected.members).some(member => member.id === id && (member.execution_mode ?? "legacy") === "legacy"))
+          .map(([id, term]) => [id, {
           terminal: terminalAddress(term), instance: terminalInstance(term),
         }])),
       });
@@ -639,6 +826,13 @@ export default class TeamCoordinator extends View {
               member.agent = ag; member.model = "default"; member.effort = "default"; cx.notify();
             }, member.agent === ag ? "selected" : "normal");
           })))
+          .child(hint(t, "执行权限"))
+          .child(actions().children([["approval", "受限沙箱"], ["full_auto", "Windows 隔离 · 完全放权"]].map(([mode, name]) =>
+            button(t, `m-mode-${member.id}-${mode}`, name, (_e, cx) => {
+              member.execution_mode = mode;
+              cx.notify();
+            }, member.execution_mode === mode ? "selected" : "normal"))))
+          .when(member.execution_mode === "approval", el => el.child(hint(t, "受管模式保留引擎沙箱，尚未接入引擎逐项审批面板。")))
           .child(hint(t, "模型"))
           .child(actions().children(models.slice(0, 14).map(mod => button(t, `m-mod-${member.id}-${mod.id}`, mod.label || mod.id, (_e, cx) => {
             member.model = mod.id; member.effort = "default"; cx.notify();
@@ -664,7 +858,7 @@ export default class TeamCoordinator extends View {
         .child(button(t, "team-add-member", "添加成员", (_e, cx) => {
           const devRole = allRoles.find(r => !r.archived && r.kind === "developer") ?? allRoles.find(r => !r.archived && r.kind !== "lead");
           if (!devRole) return;
-          draft.members.push({ id: "m-" + (draft.members.length + 1) + "-" + Date.now().toString(36).slice(-3), role: devRole.id, kind: devRole.kind, agent: "codex", model: "default", effort: "default", write_allowed: false });
+          draft.members.push({ id: "m-" + (draft.members.length + 1) + "-" + Date.now().toString(36).slice(-3), role: devRole.id, kind: devRole.kind, agent: "codex", model: "default", effort: "default", write_allowed: false, execution_mode: "approval" });
           cx.notify();
         }))
         .child(button(t, "team-cancel", "取消", (_e, cx) => { this.editingTeam = null; cx.notify(); }))
@@ -732,7 +926,7 @@ export default class TeamCoordinator extends View {
     if (!this.settingsEditing) edit.child(button(t, "edit-settings", "高级：编辑配置 JSON", (_e, cx) => {
       this.config.set_value(JSON.stringify(config, null, 2)); this.settingsEditing = true; cx.notify();
     }));
-    else edit.child(hint(t, "成员 write_allowed 控制申请写入资格。验收 acceptance 设为 chat 或 local。环境路径留空时自动发现。"))
+    else edit.child(hint(t, "受管成员的 execution_mode 可设为 approval 或 full_auto。两种档位均受 Windows 主机隔离策略约束。write_allowed 控制申请写入资格。"))
       .child(this.field(t, "配置 JSON", this.config, true, 258))
       .child(actions().child(button(t, "cancel-edit", "取消", this.busy ? null : (_e, cx) => { this.settingsEditing = false; cx.notify(); }))
         .child(button(t, "save-settings", "保存 JSON 设置", this.busy ? null : (_e, cx) => this.job(cx, async () => {
@@ -790,7 +984,8 @@ export default class TeamCoordinator extends View {
     const tabs = actions().px(14).pb(7).border_b(1).border_color(t.border)
       .children(pages.map(([id, title]) => button(t, `tab-${id}`, title, (_e, cx) => { this.page = id; cx.notify(); }, this.page === id ? "selected" : "normal")));
     const main = !this.data ? hint(t, this.busy ? "正在读取协调器运行状态…" : "等待读取本机数据。") :
-      this.page === "start" ? this.renderStart(t) : this.page === "settings" ? this.renderSettings(t) : this.renderRuns(t);
+      this.page === "start" ? this.renderStart(t) : this.page === "settings" ? this.renderSettings(t) :
+        this.page === "role" ? this.renderRole(t) : this.renderRuns(t);
     return v_flex().size_full().min_h(0).bg(t.popover).text_color(t.foreground).child(top).child(tabs)
       .when(Boolean(this.error || this.message), el => el.child(text(t, this.error || this.message, { color: this.error ? t.ansi1 : t.muted }).px(14).pt(8)))
       .child(div().id(`content-${this.page}`).flex_1().min_h(0).overflow_y_scrollbar().child(v_flex().p(14).child(main)))

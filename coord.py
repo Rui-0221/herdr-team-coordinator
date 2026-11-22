@@ -47,6 +47,7 @@ FORMATS = '''
 已接单时，助手可在角色凭据目录记录本轮 ID 和票据。只读终端在动作中附上 --task 和 --ticket。
 高风险授权（delete / permission / provider）须通过 --json 传入 scope 的 target、extent、impact，并在本地恢复页点击确认。
 写入交回证据：{"stopped":true,"terminal":"终端现场","processes":"后台进程","files":"改动","handoff":"交接凭据","external":"外部操作凭据"}。
+PowerShell 可把 UTF-8 JSON 通过管道传给 --json -，绕开原生命令参数中的双引号转义。
 共享路径和写入资格见 status；只有取得资格才能写入。独立本地授权使用 Herdr 恢复页。
 请求中断后运行 coord requests，重试可带 --request-id。每次正常调用都会生成新请求编号；--new-request 强制跳过未完成暂存。
 '''
@@ -97,6 +98,8 @@ def call(root, message, channel, *, timeout=8):
         # independent status probe confirms the service never opened its listener.
         if not isinstance(original, FileNotFoundError) or status(root)['running']:
             raise
+    if channel == 'member':
+        raise DomainError('协调器后台尚未运行', '请从本地面板启动后台，再核对原请求编号')
     try:
         start(root)
     except OSError as error:
@@ -115,6 +118,10 @@ def call(root, message, channel, *, timeout=8):
 
 
 def decode_json(raw):
+    if raw == '-':
+        raw = sys.stdin.read(65537).lstrip('\ufeff')
+        if len(raw) > 65536:
+            raise DomainError('标准输入中的 JSON 过长')
     value = json.loads(raw) if raw else {}
     if not isinstance(value, dict):
         raise DomainError('--json 需要 JSON 对象')
@@ -132,7 +139,7 @@ def local_action(root, action, params):
                 **({'error': result.get('reason', '后台仍在停止')} if not result['stopped'] else {})}
     return call(root, {'action': action, 'params': params}, 'local', timeout=120 if action in
                 ('decide', 'approve_delivery', 'save_config', 'start', 'recover_write',
-                 'rebind_lead', 'rebind_member', 'bootstrap') else 35)
+                 'rebind_lead', 'rebind_member', 'restart_managed', 'bootstrap') else 35)
 
 
 def journal_read(path):

@@ -7,7 +7,19 @@ import unittest
 from unittest.mock import Mock, patch
 import uuid
 
-from platform_runtime import Hc, PipeServer, _antigravity_models, model_catalog, request, service_mutex
+from platform_runtime import Hc, PipeServer, _antigravity_models, model_catalog, request, resolve_tools, service_mutex
+
+
+class ToolDiscoveryTests(unittest.TestCase):
+    def test_dsh_prefers_standalone_launcher_over_desktop_and_dst(self):
+        def installed(command):
+            return 'C:/fixture/Local/dsh-cli/dsh.cmd' if command.endswith(('dsh-cli\\dsh.cmd', 'dsh-cli/dsh.cmd')) else None
+
+        with patch.dict(os.environ, {'LOCALAPPDATA': 'C:/fixture/Local', 'APPDATA': 'C:/fixture/Roaming'}), \
+                patch('platform_runtime.shutil.which', side_effect=installed) as which:
+            self.assertEqual(Path(resolve_tools()['dsh']), Path('C:/fixture/Local/dsh-cli/dsh.cmd'))
+        queried = {Path(call.args[0]).name for call in which.call_args_list}
+        self.assertFalse({'dst.cmd', 'dsh.exe'} & queried)
 
 
 class DeliveryTests(unittest.TestCase):
@@ -68,6 +80,15 @@ class DeliveryTests(unittest.TestCase):
         self.hc.terminal.return_value = {"instance": "t1/123/456", "state": "live", "status": "idle", "turn": 8}
         self.assertEqual(self.hc.send("t1", "test", expected="t1/123/456", consent=True)["status"], "unknown")
 
+    def test_finished_fast_turn_is_compared_with_pre_send_snapshot(self):
+        self.hc._confirm_polls = 0
+        self.hc._call.return_value = {"turn": 9, "status": "done", "started": False}
+        initial = self.hc.terminal.return_value
+        self.hc.terminal.side_effect = [initial, {**initial, "status": "done", "turn": 9}]
+        receipt = self.hc.send("t1", "test", expected=initial["instance"], consent=True)
+        self.assertEqual(receipt["status"], "delivered")
+        self.assertEqual(receipt["evidence"]["confirmed_turn"], 9)
+
     def test_started_false_keys_enter_recovers_only_verified_marker(self):
         self.hc._confirm_polls = 1
         self.hc._confirm_interval = 0
@@ -77,9 +98,10 @@ class DeliveryTests(unittest.TestCase):
         ]
         self.hc.read = Mock(return_value={
             "complete": True,
-            "text": "• Done\n› [Herdr团队协调器 abcd12345678 v1] 收到新回报，请运行 coord status。\n  GPT-6.2-Sol",
+            "text": "• Done\n» [Herdr团队协调器 abcd12345678 v1] 收到新回报，请运行\n  coord status。\n\n  GPT-6.2-Sol",
         })
         self.hc.terminal.side_effect = [
+            {"instance": "t1/123/456", "state": "live", "status": "idle", "turn": 8},
             {"instance": "t1/123/456", "state": "live", "status": "idle", "turn": 8},
             {"instance": "t1/123/456", "state": "live", "status": "idle", "turn": 8},
             {"instance": "t1/123/456", "state": "live", "status": "idle", "turn": 8},
@@ -101,6 +123,14 @@ class DeliveryTests(unittest.TestCase):
         bad = self.hc.send("t1", "[Herdr团队协调器 abcd12345678 v1] text",
                            expected="t1/123/456", consent=True, confirm_marker="[Herdr团队协调器 abcd12345678 v1]")
         self.assertEqual(bad["status"], "unknown")
+        self.hc._call.assert_called_once()
+        self.hc._call.reset_mock()
+        self.hc.read.return_value = {
+            "complete": True, "text": "» [Herdr团队协调器 abcd12345678 v1] text edited by user",
+        }
+        self.assertEqual(self.hc.send("t1", "[Herdr团队协调器 abcd12345678 v1] text",
+                                    expected="t1/123/456", consent=True,
+                                    confirm_marker="[Herdr团队协调器 abcd12345678 v1]")["status"], "unknown")
         self.hc._call.assert_called_once()
 
     def test_done_status_omits_if_flag_and_accepts_started_true(self):

@@ -12,12 +12,14 @@ from contextlib import contextmanager
 from pathlib import Path
 
 import team_chat
+import native_worker
+import role_observability as role_log
 from artifacts import identify_worktree, overlaps, path_key
 from common import DomainError, digest, new_id, now, wire
 from config_store import apply_import, load_config, preview_import, save_config
-from platform_runtime import Hc, agent_capabilities, notify, protect_control_directory
+from platform_runtime import Hc, agent_capabilities, notify, prompt_lines, protect_control_directory
 from workflow import (amend_task, check_task_version, guard_accept, guard_dispatch, install_workflow_schema, invalidate_question, invalidate_review,
-                      record_block, route_workflow, task_requirements, workflow_status)
+                      record_block, route_workflow, task_requirements, user_directives, workflow_status)
 
 
 HERE = Path(__file__).resolve().parent
@@ -39,6 +41,8 @@ CREATE TABLE IF NOT EXISTS bindings(
     effort TEXT NOT NULL DEFAULT 'default',role_details TEXT NOT NULL DEFAULT '{}',
     launch_state TEXT NOT NULL DEFAULT 'bound',launch_evidence TEXT NOT NULL DEFAULT '',
     health TEXT NOT NULL DEFAULT 'unknown',terminal_status TEXT,paired_at REAL,
+    auto_push INTEGER NOT NULL DEFAULT 0,launch_started REAL,
+    execution_mode TEXT NOT NULL DEFAULT 'legacy',
     UNIQUE(run_id,role_id,id)
 );
 CREATE UNIQUE INDEX IF NOT EXISTS terminal_binding ON bindings(terminal) WHERE active=1 AND terminal IS NOT NULL;
@@ -53,7 +57,8 @@ CREATE TABLE IF NOT EXISTS outbox(
     round INTEGER,revision INTEGER NOT NULL,kind TEXT NOT NULL,text TEXT NOT NULL,state TEXT NOT NULL DEFAULT 'queued',
     attempt TEXT,not_before REAL NOT NULL DEFAULT 0,created REAL NOT NULL,evidence TEXT NOT NULL DEFAULT '',
     consent INTEGER NOT NULL DEFAULT 0,attempt_instance TEXT,lease_until REAL,notice_at REAL,reminded_at REAL,
-    owner TEXT NOT NULL DEFAULT '接收成员',escalation TEXT NOT NULL DEFAULT '未接单时核对会话与待办'
+    owner TEXT NOT NULL DEFAULT '接收成员',escalation TEXT NOT NULL DEFAULT '未接单时核对会话与待办',
+    chat_id TEXT,task_version INTEGER,seen_at REAL
 );
 CREATE TABLE IF NOT EXISTS requests(
     binding_id TEXT NOT NULL REFERENCES bindings,id TEXT NOT NULL,digest TEXT NOT NULL,action TEXT NOT NULL,
@@ -95,12 +100,9 @@ def shell_quote(value):
 
 def screen_blocker_reason(read_result, provider, *, is_master=False):
     """Detect obvious interactive pickers or typed Antigravity drafts before auto-send."""
-    if not isinstance(read_result, dict) or not read_result.get('complete', True):
+    lines = prompt_lines(read_result)
+    if not lines:
         return None
-    raw = read_result.get('text')
-    if not isinstance(raw, str) or not raw.strip():
-        return None
-    lines = [line.rstrip() for line in raw.splitlines() if line.strip()]
     tail = lines[-12:]
     tail_lower = '\n'.join(tail).lower()
     if any(token in tail_lower for token in (
@@ -120,7 +122,7 @@ def screen_blocker_reason(read_result, provider, *, is_master=False):
                 return '检测到 Antigravity 输入框存在未发送草稿，已暂停自动投递。'
     if provider == 'codex':
         codex_tail = lines[-8:]
-        prompt_indices = [idx for idx, line in enumerate(codex_tail) if line.lstrip().startswith('›')]
+        prompt_indices = [idx for idx, line in enumerate(codex_tail) if line.startswith(('»', '›'))]
         if prompt_indices:
             last_idx = prompt_indices[-1]
             # Submitted prompts in scrollback always have assistant/tool lines ('•') below them.
@@ -179,11 +181,15 @@ class Coordinator:
             db.executescript(SCHEMA)
             install_workflow_schema(db)
             team_chat.install(db)
+            role_log.install(db)
             self._migrate_columns(db)
         finally:
             db.close()
         with self.tx() as db:
-            db.execute("UPDATE outbox SET state='unknown',consent=0,evidence=? WHERE state='sending'",
+            db.execute("UPDATE bindings SET launch_state='pending' WHERE launch_state='preparing'")
+            db.execute("""UPDATE outbox SET kind='pause' WHERE kind='workflow' AND task_id IS NULL
+                          AND state='queued' AND text LIKE '运行已暂停。任务 %'""")
+            db.execute("UPDATE outbox SET state=CASE WHEN seen_at IS NULL THEN 'unknown' ELSE 'observed' END,consent=0,evidence=? WHERE state='sending'",
                        ('后台此前在发送中退出。请核对终端，禁止自动重发。',))
             db.execute("UPDATE interrupts SET state='unknown',evidence='后台退出，打断结果待核实' WHERE state='running'")
 
@@ -193,12 +199,25 @@ class Coordinator:
             ('bindings', 'health', "TEXT NOT NULL DEFAULT 'unknown'"),
             ('bindings', 'terminal_status', 'TEXT'),
             ('bindings', 'paired_at', 'REAL'),
+            ('bindings', 'auto_push', 'INTEGER NOT NULL DEFAULT 0'),
+            ('bindings', 'launch_started', 'REAL'),
+            ('bindings', 'execution_mode', "TEXT NOT NULL DEFAULT 'legacy'"),
             ('outbox', 'reminded_at', 'REAL'),
+            ('outbox', 'chat_id', 'TEXT'),
+            ('outbox', 'task_version', 'INTEGER'),
+            ('outbox', 'seen_at', 'REAL'),
             ('requests', 'revision', 'INTEGER NOT NULL DEFAULT 1'),
         ):
             cols = {row[1] for row in db.execute(f'PRAGMA table_info({table})')}
             if column not in cols:
                 db.execute(f'ALTER TABLE {table} ADD COLUMN {column} {ddl}')
+                if column == 'chat_id':
+                    db.execute("""UPDATE outbox SET chat_id=substr(text,6,length(text)-6-length(' 有更新，请查看 coord status。')+1)
+                                  WHERE kind='chat' AND text LIKE '团队对话 % 有更新，请查看 coord status。'""")
+                if column == 'task_version':
+                    db.execute("""UPDATE outbox SET task_version=CAST(substr(text,instr(text,'已更新到第 ')+6) AS INTEGER)
+                                  WHERE kind='workflow' AND task_id IS NOT NULL
+                                  AND text LIKE '任务「%」已更新到第 % 版，请查看要求并 ack-task。'""")
 
     @contextmanager
     def tx(self, write=True):
@@ -247,12 +266,12 @@ class Coordinator:
             raise DomainError('会话尚未绑定', '从协调器复制本角色的接入指令')
         return row
 
-    def enqueue(self, db, run, binding_id, kind, text, task=None):
+    def enqueue(self, db, run, binding_id, kind, text, task=None, *, chat_id=None, task_version=None):
         identifier = new_id()
-        db.execute('''INSERT INTO outbox(id,run_id,binding_id,task_id,round,revision,kind,text,not_before,created)
-                      VALUES(?,?,?,?,?,?,?,?,?,?)''',
+        db.execute('''INSERT INTO outbox(id,run_id,binding_id,task_id,round,revision,kind,text,not_before,created,chat_id,task_version)
+                      VALUES(?,?,?,?,?,?,?,?,?,?,?,?)''',
                    (identifier, run['id'], binding_id, task['id'] if task else None, task['round'] if task else None,
-                    run['revision'], kind, text, now(), now()))
+                     run['revision'], kind, text, now(), now(), chat_id, task_version))
         return identifier
 
     def offer(self, db, run, binding, title, instructions, required, completion, mode, *, allow_queue=False):
@@ -281,7 +300,7 @@ class Coordinator:
         if terminal:
             launch_state = 'bound'
             launch_evidence = ''
-        elif spec['agent'] == 'dsh':
+        elif spec['agent'] == 'dsh' and spec.get('execution_mode', 'legacy') == 'legacy':
             launch_state = 'awaiting_bind'
             launch_evidence = 'DSH 需绑定项目目录中的已有会话。'
         else:
@@ -290,12 +309,14 @@ class Coordinator:
         t_status = terminal.get('status') if terminal else None
         health = ('blocked' if t_status in ('blocked', 'error', 'waiting') else 'available') if terminal else 'unknown'
         db.execute('''INSERT INTO bindings(id,run_id,role_id,kind,terminal,instance,created_by_plugin,write_allowed,provider,
-                       model,token,effort,role_details,launch_state,launch_evidence,health,terminal_status)
-                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
+                       model,token,effort,role_details,launch_state,launch_evidence,health,terminal_status,
+                       execution_mode)
+                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
                    (identifier, run_id, spec['id'], kind, terminal['address'] if terminal else None,
-                    terminal['instance'] if terminal else None, int(not terminal and spec['agent'] != 'dsh'),
+                     terminal['instance'] if terminal else None, int(launch_state == 'pending'),
                     spec['write_allowed'], spec['agent'], spec['model'], new_id() + new_id(),
-                    spec.get('effort', 'default'), wire(role), launch_state, launch_evidence, health, t_status))
+                     spec.get('effort', 'default'), wire(role), launch_state, launch_evidence, health, t_status,
+                     spec.get('execution_mode', 'legacy')))
         return identifier
 
     def journal_dir(self, binding):
@@ -334,8 +355,10 @@ class Coordinator:
             '不要对其他人的转述重复执行。原生用户直接提问时向当前用户作答，面板提问用 say --source 保存答复。'
             '只处理发给自己的 pending_messages。指令变更后在安全点读取新版，ack-task --version N；handoff 和 request-write 带 --version N。'
             '成员转述与聊天记录不可代替用户的授权。\n'
+            '仅用 coord 管理团队。不要调用 hc、herdr-app、桌面自动化或其他会话工具。需要本地恢复时，通过 coord say 报告后结束当前回合。'
+            '遇到 waiting/blocked 时结束当前回复。写入资格释放后协调器会唤醒你重新申请。不要在回合内循环查询或设置轮询定时器。\n'
             + ('主控可使用 dispatch、cancel-task、pause、resume、change-goal、resolve-revision、review-start、ask、answer。'
-               '派错时用 cancel-task 撤回。用 `coord help` 查看参数。派工或等待回报后可直接结束当前回复等待协调器推送，也可随时运行 `coord status` 查看进度与成员回报。'
+               '派错时用 cancel-task 撤回。用 `coord help` 查看参数。派工后结束当前回复等待协调器唤醒。若成员尚未就绪，结束当前回复并等待成员接入通知。'
                if binding['kind'] == 'master' else '先运行 `coord status` 查看待办，拿到任务后按提示接单并工作；结束后提交交接并结束当前回复等待后续消息。')
         )
 
@@ -351,7 +374,8 @@ class Coordinator:
             raise DomainError('首版只绑定本机终端')
         expected = {'codex': {'codex'}, 'dsh': {'dsh', 'dsh-tui', 'dst'}, 'antigravity': {'antigravity', 'agy'}}
         if terminal_app(terminal) not in expected.get(provider, {provider}):
-            raise DomainError('CLI 类型与角色配置不匹配', '选择已识别的对应 Agent 会话')
+            raise DomainError('CLI 尚未被识别，或类型与角色配置不匹配',
+                              '先在目标终端处理启动、信任或更新菜单，等待 Core 报告 Agent 类型，再刷新并绑定')
         if (terminal.get('labels') or {}).get('team.run'):
             raise DomainError('这是旧版团队的会话', '选择其他终端和独立工作树')
         try:
@@ -373,15 +397,25 @@ class Coordinator:
             item = public(row, 'capability')
             item['ticket'] = row['capability']
             item['select'] = f'--task {row["id"]} --ticket {row["capability"]}'
+            item['user_directives'] = user_directives(db, row['id'])
             candidates.append(item)
         inbox = db.execute('''SELECT id,task_id,kind,text,state,revision,created FROM outbox WHERE binding_id=?
                               AND revision=? AND state NOT IN ('obsolete','stale_delivery') ORDER BY created DESC LIMIT 100''',
                            (binding['id'], run['revision'])).fetchall()
         result = {'run': public(run), 'role': binding['role_id'], 'kind': binding['kind'], 'candidates': candidates,
                   'inbox': [dict(row) for row in inbox],
-                  'conversation': team_chat.page(db, run['id']),
+                  'conversation': team_chat.page(db, run['id'], participant=binding['role_id'] if binding['kind'] != 'master' else None),
                   'pending_messages': team_chat.page(db, run['id'], pending_for=binding['role_id'], revision=run['revision']),
                   **workflow_status(db, run['id'])}
+        # A status result is evidence that the authenticated role received these rows over IPC.
+        # Keep business actions pending until the role explicitly replies, accepts or acknowledges.
+        db.executemany("""UPDATE outbox SET seen_at=?,consent=0,
+                          state=CASE WHEN state='sending' THEN state ELSE 'observed' END,
+                          evidence=CASE WHEN state='sending' THEN evidence ELSE '接收角色通过 coord status 读取' END
+                          WHERE id=? AND state IN ('queued','unknown','sending')""",
+                       [(now(), row['id']) for row in inbox if row['kind'] != 'offer'
+                        and not (binding['execution_mode'] != 'legacy' and row['kind'] == 'chat' and row['state'] == 'queued')
+                        and row['state'] in ('queued', 'unknown', 'sending')])
         members = []
         for item in db.execute('SELECT * FROM bindings WHERE run_id=? AND active=1 ORDER BY kind,role_id', (run['id'],)):
             profile = json.loads(item['role_details'])
@@ -390,37 +424,58 @@ class Coordinator:
             members.append(info)
         result['members'] = members
         if actor['kind'] == 'master':
-            result['tasks'] = [public(row, 'capability') for row in db.execute(
+            result['tasks'] = [{**public(row, 'capability'), 'user_directives': user_directives(db, row['id'])} for row in db.execute(
                 'SELECT * FROM tasks WHERE run_id=? ORDER BY created', (run['id'],))]
         return result
 
-    def member(self, payload):
+    def member(self, payload, *, native=False):
         auth = payload.get('auth') or {}
+        if not isinstance(auth, dict):
+            raise DomainError('角色鉴权格式无效')
         with self.tx(False) as db:
             binding = self.get_binding(db, auth.get('binding'))
         if not isinstance(auth.get('token'), str) or not hmac.compare_digest(auth['token'], binding['token']):
             raise DomainError('角色凭据无效', '使用本会话最新的接入指令')
-        if not binding['active'] or not binding['terminal'] or binding['terminal'] != auth.get('terminal'):
+        action = payload['action']
+        managed = binding['execution_mode'] != 'legacy'
+        native_control = action in ('native-next', 'native-finish', 'native-failed')
+        if (native and not managed) or (managed and not native and not native_control):
+            raise DomainError('当前角色的协调器传输不匹配')
+        if managed and action == 'native-next' and not binding['active'] and binding['terminal'] == auth.get('terminal'):
+            return {'closed': True}
+        final_receipt = managed and action == 'native-finish'
+        if ((not binding['active'] and not final_receipt) or not binding['terminal']
+                or binding['terminal'] != auth.get('terminal')):
             raise DomainError('请求终端与当前角色绑定不符', '从已核验的会话执行，或打开本地恢复页')
         terminal = self.hc().terminal(binding['terminal'])
         if (not terminal or terminal.get('state') != 'live' or terminal.get('instance') != binding['instance']):
             raise DomainError('会话实例已经变化或无法核实', '请在本地恢复页重新绑定')
-        action = payload['action']
-        write_tx = action not in {'status', 'requests', 'history'} or binding['paired_at'] is None
+        write_tx = action not in {'requests', 'history'} or binding['paired_at'] is None
         with self.tx(write_tx) as db:
             current = self.get_binding(db, binding['id'])
-            if not current['active'] or current['instance'] != binding['instance']:
+            closed_receipt = final_receipt and self.get_run(db, current['run_id'])['state'] == 'accepted'
+            if (not current['active'] and not closed_receipt) or current['instance'] != binding['instance']:
                 raise DomainError('绑定刚刚变化，请重新获取工作上下文')
+            if native_control:
+                if not managed or native:
+                    raise DomainError('原生回合仅允许本地受管驱动器操作')
+                return self.native_turn(db, current, action, payload['params'])
             if current['paired_at'] is None:
                 db.execute('UPDATE bindings SET paired_at=? WHERE id=?', (now(), binding['id']))
+                if current['kind'] != 'master':
+                    self.relay(db, current['run_id'], f"成员 {current['role_id']} 已接入，可检查成员状态并派工。")
+                    self.wake.set()
             actor = {'channel': 'member', 'run_id': binding['run_id'], 'binding_id': binding['id'],
                      'role_id': binding['role_id'], 'kind': binding['kind'], 'task_id': None}
             if action == 'status':
-                return self.member_status(db, actor)
+                result = self.member_status(db, actor)
+                self.wake.set()
+                return result
             if action == 'history':
                 params = payload['params']
                 task_id = params.get('task_id')
-                history = {'conversation': team_chat.page(db, binding['run_id'], before=params.get('before'), task_id=task_id)}
+                history = {'conversation': team_chat.page(db, binding['run_id'], before=params.get('before'), task_id=task_id,
+                               participant=binding['role_id'] if binding['kind'] != 'master' else None)}
                 if task_id:
                     history['requirements'] = task_requirements(db, binding['run_id'], task_id, params.get('version'))
                 return history
@@ -478,7 +533,7 @@ class Coordinator:
                 raise DomainError('这是旧目标版本的执行项', '停止本轮操作并核对版本，旧写入资格可用 yield 交回')
             actor['task_id'] = task['id']
         source = None
-        if params.get('source') and action in ('say','dispatch','amend-task'):
+        if params.get('source') and action in ('say','dispatch','amend-task','change-goal'):
             source, effect_hash = team_chat.pending_action(db, run, actor, params, action)
             if source['result']:
                 result = json.loads(source['result'])
@@ -503,6 +558,11 @@ class Coordinator:
                 self.relay(db, run['id'], f"{actor['role_id']} 更新了任务 {result['task_id']}，请查看团队对话。")
             result['action'] = action
             team_chat.finish_action(db, source, result, effect_hash)
+            db.execute("""UPDATE outbox SET seen_at=?,consent=0,
+                          state=CASE WHEN state='sending' THEN state ELSE 'observed' END,
+                          evidence='接收角色已处理对话'
+                          WHERE binding_id=? AND chat_id=? AND state IN ('queued','unknown','sending')""",
+                       (now(), binding_id, source['id']))
         elif action == 'amend-task':
             changed_text = '\n'.join(str(params[k]) for k in ('instructions','completion') if k in params)
             team_chat.record(db, run, actor['role_id'], 'terminal', {'message_id': request_id,
@@ -529,7 +589,8 @@ class Coordinator:
         current = self.get_run(db, run['id'])
         for notice in notices:
             task = db.execute('SELECT * FROM tasks WHERE id=?', (notice.get('task_id'),)).fetchone()
-            self.enqueue(db, current, notice['binding_id'], 'workflow', notice['text'], task)
+            self.enqueue(db, current, notice['binding_id'], notice.get('kind', 'workflow'), notice['text'], task,
+                         task_version=notice.get('task_version'))
 
     def mutate(self, db, action, actor, params, run):
         if action == 'amend-task':
@@ -544,6 +605,12 @@ class Coordinator:
                     if task['state'] not in ('offered','accepted','blocked','yielded','queued'):
                         raise DomainError('此任务已结束')
                     db.execute('UPDATE tasks SET ack_version=task_version WHERE id=?', (task['id'],))
+                    db.execute("""UPDATE outbox SET seen_at=?,consent=0,
+                                  state=CASE WHEN state='sending' THEN state ELSE 'observed' END,
+                                  evidence='接收角色已确认任务版本'
+                                  WHERE task_id=? AND binding_id=? AND kind='workflow' AND task_version<=?
+                                  AND state IN ('queued','unknown','sending')""",
+                               (now(), task['id'], task['binding_id'], task['task_version']))
                     return {'task_id': task['id'], 'ack_version': task['task_version']}
                 if task['ack_version'] != task['task_version']:
                     raise DomainError('请先用 ack-task 确认最新任务要求')
@@ -573,8 +640,11 @@ class Coordinator:
                     raise DomainError('任务当前不能接单', '运行 coord status 查看本轮状态')
                 guard_accept(db, task)
                 db.execute("UPDATE tasks SET state='accepted' WHERE id=?", (task['id'],))
-                db.execute("UPDATE outbox SET state='delivered',consent=0,evidence='成员通过协调器核对本轮并接单' "
-                           "WHERE task_id=? AND state='queued'", (task['id'],))
+                db.execute("""UPDATE outbox SET seen_at=?,consent=0,
+                              state=CASE WHEN state='sending' THEN state ELSE 'delivered' END,
+                              evidence='成员通过协调器核对本轮并接单'
+                              WHERE task_id=? AND kind='offer' AND round=? AND state IN ('queued','unknown','sending')""",
+                           (now(), task['id'], task['round']))
                 return {'task_id': task['id'], 'state': 'accepted', 'round': task['round']}
             if task['state'] not in ('accepted', 'blocked'):
                 raise DomainError('先核对并接单，才能登记受阻')
@@ -590,9 +660,19 @@ class Coordinator:
         result = route_workflow(db, action, actor, params, offer=self.offer)
         if result is None:
             raise DomainError('此角色没有该操作', '查询运行状态或打开本地协调器')
-        if action in ('pause', 'change-goal'):
+        if action == 'change-goal':
             db.execute("""UPDATE outbox SET state='stale_delivery',consent=0,evidence='发送中变更运行状态，旧正文可能已到达'
                           WHERE run_id=? AND state='sending'""", (run['id'],))
+            # Keep pending user chat addressable across a goal revision. Task directives keep
+            # their historical task association and travel with an explicitly carried task.
+            current = self.get_run(db, run['id'])
+            for message in db.execute('''SELECT m.id,b.id AS binding_id FROM team_messages m JOIN bindings b
+                ON b.run_id=m.run_id AND b.role_id=m.recipient AND b.active=1
+                WHERE m.run_id=? AND m.revision=? AND m.origin='panel' AND m.result IS NULL
+                AND m.task_id IS NULL AND m.id!=?''', (run['id'], run['revision'], params.get('source') or '')).fetchall():
+                db.execute('UPDATE team_messages SET revision=? WHERE run_id=? AND id=?',
+                           (current['revision'], run['id'], message['id']))
+                self.enqueue(db, current, message['binding_id'], 'chat', '新目标下仍有用户消息待处理。', chat_id=message['id'])
         if action == 'cancel-task':
             db.execute("""UPDATE outbox SET state='stale_delivery',consent=0,evidence='发送中撤回任务，旧正文可能已到达'
                           WHERE run_id=? AND task_id=? AND state='sending'""", (run['id'], params.get('task_id')))
@@ -606,6 +686,63 @@ class Coordinator:
             db.executemany("INSERT INTO interrupts(id,run_id,binding_id,terminal,instance,state,created) VALUES(?,?,?,?,?,'queued',?)",
                 [(new_id(), run['id'], row['id'], row['terminal'], row['instance'], now()) for row in bindings])
         return result
+
+    def role_inspector(self, params):
+        role = required_text(params, 'role_id', 80)
+        with self.tx(False) as db:
+            run = self.get_run(db, params.get('run_id'))
+            binding = db.execute('''SELECT * FROM bindings WHERE run_id=? AND role_id=?
+                ORDER BY active DESC,rowid DESC LIMIT 1''', (run['id'], role)).fetchone()
+            if not binding:
+                raise DomainError('未找到本次运行的角色')
+            history = [dict(row) for row in db.execute('''SELECT id,title,state,round,revision,task_version,ack_version
+                FROM tasks WHERE run_id=? AND role_id=? ORDER BY revision DESC,round DESC LIMIT 24''', (run['id'], role))]
+            selected = params.get('task_id') or next((row['id'] for row in history if row['state'] not in
+                ('handed_off','cancelled','superseded','needs_decision')), history[0]['id'] if history else None)
+            task = db.execute('SELECT * FROM tasks WHERE id=? AND run_id=? AND role_id=?', (selected, run['id'], role)).fetchone()
+            if selected and not task:
+                raise DomainError('任务与当前角色不匹配')
+            task_view = None
+            if task:
+                task_view = {**public(task, 'capability'), **task_requirements(db, run['id'], selected, params.get('version'))}
+            turns = role_log.attempts(db, run['id'], role)
+            grants = [dict(row) for row in db.execute('''SELECT task_id,round,resource,path,created,released
+                FROM workflow_grants WHERE run_id=? AND role_id=? ORDER BY created DESC LIMIT 24''', (run['id'], role))]
+            chat = team_chat.page(db, run['id'], participant=role, before=params.get('before'), limit=12)
+            handoffs = [dict(row) for row in db.execute('''SELECT task_id,round,kind,report,paths,created
+                FROM workflow_handoffs WHERE run_id=? AND role_id=? ORDER BY created DESC LIMIT 4''', (run['id'], role))]
+        metadata = json.loads(binding['role_details'])
+        return {'run': public(run), 'role': {**public(binding, 'token', 'role_details'), 'name': metadata.get('name'),
+                                           'duties': metadata.get('duties', '')},
+                'task': task_view, 'tasks': history, 'turns': turns, 'grants': grants, 'conversation': chat,
+                'handoffs': handoffs, 'summary': role_log.summary(self.control, turns)}
+
+    def role_output(self, params):
+        with self.tx(False) as db:
+            binding = db.execute('''SELECT * FROM bindings WHERE run_id=? AND role_id=?
+                ORDER BY active DESC,rowid DESC LIMIT 1''', (params.get('run_id'), params.get('role_id'))).fetchone()
+            if not binding:
+                raise DomainError('未找到本次运行的角色')
+            attempt = params.get('attempt')
+            turn = role_log.attempts(db, binding['run_id'], binding['role_id'], attempt) if attempt else None
+        if not turn:
+            if attempt or binding['execution_mode'] != 'legacy':
+                raise DomainError('未找到此角色的原生回合')
+            core = self.hc()
+            target = core.terminal(binding['terminal']) if binding['terminal'] else None
+            if target and target.get('instance') == binding['instance']:
+                screen = core.read(binding['terminal'], lines=80)
+                current = core.terminal(binding['terminal'])
+                if current and current.get('instance') == binding['instance']:
+                    return {'screen': role_log.safe_text(screen.get('text', '')[-12000:], 12000)}
+            return {'screen': ''}
+        path = role_log.evidence_path(self.control, turn['binding_id'], turn['delivery_id'], attempt)
+        complete = turn['state'] in ('delivered', 'observed', 'obsolete', 'historic')
+        return {'attempt': attempt,
+                'prompt': (role_log.safe_text(turn['prompt'] or '', 140000) if params.get('include_prompt') else None),
+                'stdout': role_log.output_page(path.with_suffix('.stdout.jsonl'), params.get('stdout_after'), complete=complete),
+                'stderr': role_log.output_page(path.with_suffix('.stderr'), params.get('stderr_after'), stderr=True,
+                                              complete=complete, byte_limit=16000, line_limit=12)}
 
     def dashboard(self, selected_run=None, before=None):
         platform = {}
@@ -698,6 +835,18 @@ class Coordinator:
         if acceptance not in ('chat', 'local'):
             raise DomainError('验收方式无效')
         roles = {role['id']: role for role in config['roles']}
+        managed_roles = [spec for spec in team['members'] if spec['execution_mode'] != 'legacy']
+        if managed_roles:
+            if os.name != 'nt':
+                raise DomainError('受管权限档位需要 Windows')
+            adapter = self.hc()
+            for spec in managed_roles:
+                native_worker.installed_engine(spec['agent'], adapter.tools.get(spec['agent']))
+                native_worker.engine_arguments(spec['agent'], spec['execution_mode'],
+                                               model=spec['model'], effort=spec['effort'])
+            protected = (self.root, HERE, Path.home() / '.config/herdr-app', Path.home() / 'HerdrTeamCoordinator')
+            if any(overlaps(tree.root, item) for item in protected):
+                raise DomainError('项目范围包含协调器或 Herdr 控制数据')
         if any(spec['write_allowed'] for spec in team['members']):
             for terminal in self.hc().snapshot():
                 if (terminal.get('state') == 'live' and (terminal.get('labels') or {}).get('team.run') and
@@ -719,6 +868,8 @@ class Coordinator:
         for spec in team['members']:
             choice = choices.get(spec['id'])
             if choice:
+                if spec['execution_mode'] != 'legacy':
+                    raise DomainError('受管权限档位必须由 Windows 隔离驱动器启动')
                 choice = {'terminal': choice} if isinstance(choice, str) else choice
                 if not isinstance(choice, dict) or not choice.get('instance'):
                     raise DomainError('绑定已有终端需要明确的实例编号', '刷新并重新选择终端')
@@ -726,9 +877,11 @@ class Coordinator:
         if len(targets) != len(set(terminal['address'] for terminal in targets.values())):
             raise DomainError('同一终端只能绑定一个角色')
         scopes = '\n'.join(f'{spec["id"]} / {spec["agent"]} / {targets.get(spec["id"], {}).get("address", "待绑定" if spec["agent"] == "dsh" else "新会话")}'
+                          + (' / Windows 隔离免审批' if spec['execution_mode'] == 'full_auto' else ' / 人工审批')
                           + (' / 可申请写入资格' if spec['write_allowed'] else ' / 协议只读') for spec in team['members'])
         if not self.confirm('确认启动协调器团队', f'项目：{project}\n目标：{goal[:2000]}\n涉及成员：\n{scopes}\n\n'
-                            '新会话会加载该团队目标；已有会话须手动接入。确认本次启动吗？'):
+                            'Windows 受管角色使用受限进程，插件和控制文件会阻止低完整性访问。'
+                            '有写入角色时项目目录会使用低完整性标签。确认本次启动吗？'):
             raise DomainError('本次团队启动已取消')
         master_spec = next(spec for spec in team['members'] if spec['kind'] == 'lead')
         master_target = targets.get(master_spec['id'])
@@ -749,47 +902,76 @@ class Coordinator:
         self.wake.set()
         return {'id': run_id, 'run_id': run_id, 'state': 'active'}
 
-    def rebind(self, params, *, master_only=True):
+    def rebind(self, params, *, master_only=True, managed=False):
         run_id = params.get('run_id')
         with self.tx(False) as db:
             run = self.get_run(db, run_id)
-            if master_only:
+            if master_only and not managed:
                 old = db.execute("SELECT * FROM bindings WHERE run_id=? AND kind='master' AND active=1", (run_id,)).fetchone()
             else:
                 old = self.get_binding(db, params.get('binding_id'))
-                if old['kind'] == 'master' or old['run_id'] != run_id or not old['active']:
+                if (old['kind'] == 'master' and not managed) or old['run_id'] != run_id or not old['active']:
                     raise DomainError('请选择此运行中当前绑定的成员')
         if run['state'] == 'accepted' or not old:
             raise DomainError('当前运行不能重连此角色')
-        terminal = self.match_terminal(required_text(params, 'terminal', 80), required_text(params, 'instance', 300),
-                                       old['provider'], run['root'])
-        if terminal['instance'] != old['instance'] and not self.confirm('核对角色会话接管',
+        master_only = old['kind'] == 'master'
+        if old['execution_mode'] != 'legacy' and not managed:
+            raise DomainError('隔离角色只能受管重建')
+        if managed and ((old['provider'] == 'dsh' and old['execution_mode'] == 'legacy') or
+                        old['launch_state'] in ('pending','preparing','launching')):
+            raise DomainError('此角色已有启动请求，或需要绑定已有 DSH 会话')
+        terminal = None if managed else self.match_terminal(
+            required_text(params, 'terminal', 80), required_text(params, 'instance', 300), old['provider'], run['root'])
+        auto_push = params.get('auto_push', False)
+        if type(auto_push) is not bool or managed and auto_push:
+            raise DomainError('自动推送设置无效')
+        if (managed or auto_push or terminal['instance'] != old['instance']) and not self.confirm('核对角色会话接管',
                 f'项目：{run["root"]}\n角色：{old["role_id"]}\n目标版本：{run["revision"]}\n'
-                f'原终端：{old["terminal"] or "未绑定"}\n新终端：{terminal["address"]} / {terminal["instance"]} / {old["provider"]}\n'
+                f'原终端：{old["terminal"] or "未绑定"}\n'
+                + ('创建新的受管会话，轮换角色凭据。\n' if managed else
+                   f'新终端：{terminal["address"]} / {terminal["instance"]} / {old["provider"]}\n')
+                + ('完成鉴权配对后允许自动推送。\n' if auto_push else '')
+                +
                 '新角色凭据仅用于这次已核对的会话。确认绑定吗？'):
             raise DomainError('本次绑定已取消')
-        terminal = self.match_terminal(terminal['address'], terminal['instance'], old['provider'], run['root'])
+        if terminal:
+            terminal = self.match_terminal(terminal['address'], terminal['instance'], old['provider'], run['root'])
         old_terminal_live = self.hc().terminal(old['terminal']) if old['terminal'] else None
         old_dead = (not old['terminal'] or not old_terminal_live or old_terminal_live.get('state') != 'live'
                     or old_terminal_live.get('instance') != old['instance'])
+        if managed:
+            if not old_dead:
+                raise DomainError('原终端仍在运行', '先结束原 CLI 并确认停写，再启动新的受管会话')
+            if now() - (old['launch_started'] or 0) < 20:
+                raise DomainError('原启动请求仍在核对时间内，请稍后刷新')
+            if any(t.get('state') == 'live' and (t.get('labels') or {}).get('herdr.coord.binding') == old['id']
+                   for t in self.hc().snapshot()):
+                raise DomainError('找到原启动标签的存活终端', '等待协调器接回该实例')
         with self.tx() as db:
-            if not self.get_binding(db, old['id'])['active'] or self.get_run(db, run_id)['revision'] != run['revision']:
+            checked_run = self.get_run(db, run_id)
+            checked_old = self.get_binding(db, old['id'])
+            if (not checked_old['active'] or checked_run['revision'] != run['revision'] or
+                    checked_run['state'] != run['state'] or checked_old['instance'] != old['instance'] or
+                    checked_old['launch_state'] != old['launch_state']):
                 raise DomainError('绑定或目标刚刚发生变化，请刷新后重试')
-            checked = db.execute('SELECT id FROM bindings WHERE active=1 AND terminal=?', (terminal['address'],)).fetchone()
+            checked = db.execute('SELECT id FROM bindings WHERE active=1 AND terminal=?',
+                                 (terminal['address'] if terminal else None,)).fetchone()
             if checked and checked['id'] != old['id']:
                 raise DomainError('所选会话已经绑定另一角色')
-            if terminal['address'] == old['terminal'] and terminal['instance'] == old['instance']:
+            if terminal and terminal['address'] == old['terminal'] and terminal['instance'] == old['instance']:
                 t_status = terminal.get('status')
                 t_health = 'blocked' if t_status in ('blocked', 'error', 'waiting') else 'available'
                 db.execute("UPDATE bindings SET health=?,terminal_status=?,launch_state='bound' WHERE id=?",
                            (t_health, t_status, old['id']))
+                if auto_push:
+                    db.execute('UPDATE bindings SET auto_push=1 WHERE id=?', (old['id'],))
                 if master_only:
                     db.execute("UPDATE runs SET master_state=? WHERE id=?", (t_health, run_id))
                 else:
                     self.audit(db, run_id, 'reconnect', 'local', {'role': old['role_id'], 'terminal': terminal['address']})
                 self.wake.set()
                 return {'id': old['id'], 'state': 'reconnected'}
-            if not master_only:
+            if not master_only or managed:
                 continuity = workflow_status(db, run_id)
                 if any(grant.get('binding_id') == old['id'] or grant.get('role_id') == old['role_id']
                        for grant in continuity.get('write_grants', []) if grant.get('state', 'active') == 'active'):
@@ -800,7 +982,7 @@ class Coordinator:
                         raise DomainError('成员还有在途执行项', '请先暂停运行，或待原会话退出/交接后再更换')
                     if old['kind'] == 'reviewer':
                         invalidate_review(db, run_id, '原审查会话已更换。')
-                    else:
+                    elif not managed:
                         for task in current:
                             db.execute("UPDATE tasks SET state='yielded' WHERE id=?", (task['id'],))
                             db.execute('''INSERT INTO workflow_handoffs(id,run_id,task_id,round,revision,role_id,kind,report,paths,evidence,created)
@@ -808,23 +990,39 @@ class Coordinator:
                                        (new_id(), run_id, task['id'], task['round'], task['revision'], task['role_id'],
                                         '原会话未持有写入资格且已更换，任务保留待恢复或重派。', now()))
             db.execute('UPDATE bindings SET active=0 WHERE id=?', (old['id'],))
-            db.execute("UPDATE outbox SET state='obsolete',consent=0,evidence='接收会话已替换' WHERE binding_id=? AND state='queued'",
-                       (old['id'],))
             db.execute("UPDATE outbox SET state='stale_delivery',consent=0,evidence='发送中更换实例，旧正文可能已到达' WHERE binding_id=? AND state='sending'",
                        (old['id'],))
             new_binding = self.binding_insert(db, run_id, {'id': old['role_id'], 'kind': old['kind'],
-                'write_allowed': bool(old['write_allowed']), 'agent': old['provider'], 'model': old['model'], 'effort': old['effort']},
+                'write_allowed': bool(old['write_allowed']), 'agent': old['provider'], 'model': old['model'],
+                'effort': old['effort'], 'execution_mode': old['execution_mode']},
                 json.loads(old['role_details']), terminal)
+            if auto_push:
+                db.execute('UPDATE bindings SET auto_push=1 WHERE id=?', (new_binding,))
             db.execute("UPDATE tasks SET binding_id=?,capability=lower(hex(randomblob(16))) WHERE binding_id=? AND state='queued'",
                        (new_binding, old['id']))
+            if managed and old['kind'] == 'member':
+                tasks = db.execute("""UPDATE tasks SET binding_id=?,capability=lower(hex(randomblob(16))),state='offered'
+                                    WHERE binding_id=? AND revision=? AND state IN ('offered','accepted','blocked','yielded')
+                                    RETURNING *""", (new_binding, old['id'], run['revision'])).fetchall()
+                for task in tasks:
+                    self.enqueue(db, run, new_binding, 'offer', '受管会话已续接原任务，请核对最新要求并重新接单。', task)
+            db.execute("""UPDATE outbox SET binding_id=?,state='queued',consent=0,attempt=NULL,attempt_instance=NULL,
+                        lease_until=NULL,notice_at=NULL,not_before=?
+                        WHERE binding_id=? AND revision=? AND state IN ('queued','unknown')
+                        AND task_id IS NULL AND kind IN ('chat','report')""",
+                       (new_binding, now(), old['id'], run['revision']))
+            db.execute("UPDATE outbox SET state='obsolete',consent=0,evidence='接收会话已替换' WHERE binding_id=? AND state='queued'",
+                       (old['id'],))
             if master_only:
                 invalidate_review(db, run_id, '主控会话已替换，需重新进行版本确认')
                 invalidate_question(db, run_id, '主控会话已替换，需重新向用户提问')
-                db.execute("UPDATE runs SET master_state='available' WHERE id=?", (run_id,))
-            self.audit(db, run_id, 'rebind', 'local', {'role': old['role_id'], 'previous': old['terminal'],
-                                                      'terminal': terminal['address'], 'instance': terminal['instance']})
+                db.execute('UPDATE runs SET master_state=? WHERE id=?', ('unknown' if managed else 'available', run_id))
+            self.audit(db, run_id, 'restart-managed' if managed else 'rebind', 'local',
+                       {'role': old['role_id'], 'previous': old['terminal'],
+                        'terminal': terminal['address'] if terminal else None,
+                        'instance': terminal['instance'] if terminal else None})
         self.wake.set()
-        return {'id': new_binding, 'state': 'bound'}
+        return {'id': new_binding, 'state': 'pending' if managed else 'bound'}
 
     def get_delivery(self, db, params):
         row = db.execute('SELECT * FROM outbox WHERE id=? AND run_id=?',
@@ -837,6 +1035,8 @@ class Coordinator:
         with self.tx(False) as db:
             delivery = self.get_delivery(db, params)
             binding = self.get_binding(db, delivery['binding_id'])
+            if binding['execution_mode'] != 'legacy':
+                raise DomainError('隔离角色由原生队列唤醒')
             if delivery['state'] != 'queued' or not binding['terminal'] or not binding['active']:
                 raise DomainError('只有已绑定终端的待发消息可以单独推送', '结果未知的投递请核对，成员也可主动查询')
         body = (f'目标：{binding["terminal"]} / {binding["role_id"]}\n轮次：{delivery["round"]}，目标版本：{delivery["revision"]}\n\n'
@@ -848,7 +1048,7 @@ class Coordinator:
             cur_binding = self.get_binding(db, current['binding_id'])
             run = self.get_run(db, delivery['run_id'])
             slot = db.execute("""SELECT o.id FROM outbox o JOIN bindings b ON b.id=o.binding_id
-                WHERE b.instance=? AND (o.state IN ('sending','unknown','stale_delivery') OR (o.state='queued' AND o.consent=1))""",
+                WHERE b.active=1 AND b.instance=? AND (o.state IN ('sending','unknown','stale_delivery') OR (o.state='queued' AND o.consent=1))""",
                 (binding['instance'],)).fetchone()
             unchanged = ((current['state'], current['revision'], current['binding_id'], current['task_id'],
                           current['round'], current['kind'], current['text']) ==
@@ -937,9 +1137,32 @@ class Coordinator:
             return result
 
     def local(self, action, params):
-        if action == 'say':
+        if action in ('say', 'steer-task'):
             with self.tx() as db:
-                return team_chat.record(db, self.get_run(db, params.get('run_id')), '用户', 'panel', params, self.enqueue)
+                run = self.get_run(db, params.get('run_id'))
+                if action == 'say':
+                    return team_chat.record(db, run, '用户', 'panel', params, self.enqueue)
+                role = required_text(params, 'to', 80)
+                identifier = required_text(params, 'task_id', 100)
+                task = db.execute('SELECT * FROM tasks WHERE id=? AND run_id=? AND role_id=?',
+                                  (identifier, run['id'], role)).fetchone()
+                if not task:
+                    raise DomainError('任务与接收角色不匹配')
+                # Include the submitted version in the message fingerprint, including on retries.
+                receipt = team_chat.record(db, run, '用户', 'panel', {**params, 'directive': True}, self.enqueue)
+                prior = db.execute('SELECT version FROM workflow_user_directives WHERE task_id=? AND message_id=?',
+                                   (identifier, receipt['message_id'])).fetchone()
+                if prior:
+                    return {**receipt, 'task_id': identifier, 'task_version': prior['version']}
+                amendment = amend_task(db, run, {'kind': 'user'}, params)
+                self.apply_notices(db, run, amendment)
+                self.relay(db, run['id'], f'用户直接调整了 {role} 的任务 {task["title"]}，现为第 {amendment["task_version"]} 版。请保留用户原文。')
+                self.audit(db, run['id'], 'steer-task', '用户', {**receipt, **amendment})
+                return {**receipt, 'task_id': identifier, 'task_version': amendment['task_version']}
+        if action == 'role-inspector':
+            return self.role_inspector(params)
+        if action == 'role-output':
+            return self.role_output(params)
         if action == 'service-stop':
             self.stop.set()
             return {'stopping': True, 'pid': os.getpid()}
@@ -951,6 +1174,8 @@ class Coordinator:
             return self.start_run(params)
         if action in ('rebind_lead', 'rebind_member'):
             return self.rebind(params, master_only=action == 'rebind_lead')
+        if action == 'restart_managed':
+            return self.rebind(params, managed=True)
         if action == 'approve_delivery':
             return self.approve_delivery(params)
         if action == 'decide':
@@ -965,13 +1190,14 @@ class Coordinator:
                 previous = load_config(db)
             if previous != config:
                 def approvals(value):
-                    return {(team['id'], member['id'], member['agent'], member['role']) for team in value['teams']
-                            for member in team['members'] if member['write_allowed']}
+                    return {(team['id'], member['id'], member['agent'], member['role'], member['execution_mode'])
+                            for team in value['teams']
+                            for member in team['members'] if member['write_allowed'] or member['execution_mode'] == 'full_auto'}
 
                 extra = approvals(config) - approvals(previous)
                 paths = config['settings'] if config['settings'] != previous['settings'] else None
                 if (extra or paths) and not self.confirm('确认调整团队权限或工具路径',
-                    f'新增允许申请写入的角色：{wire(sorted(extra))}\n工具路径设置：{wire(paths)}\n'
+                    f'新增或变更权限的角色：{wire(sorted(extra))}\n工具路径设置：{wire(paths)}\n'
                     '应用范围：后续团队启动和协调器使用的本机工具。现有角色的写入授权不会自动提升。'):
                     raise DomainError('配置修改已取消')
             with self.tx() as db:
@@ -984,6 +1210,8 @@ class Coordinator:
                 run = self.get_run(db, params.get('run_id'))
                 if binding['run_id'] != run['id'] or not binding['active'] or not binding['terminal']:
                     raise DomainError('此角色尚未完成终端绑定')
+                if binding['execution_mode'] != 'legacy':
+                    raise DomainError('隔离角色已通过原生驱动器提供角色接入指令')
             self.journal_dir(binding).mkdir(parents=True, exist_ok=True)
             command, prompt = self.bootstrap(run, binding)
             if not self.confirm('显示角色接入指令',
@@ -1034,10 +1262,19 @@ class Coordinator:
         try:
             if self.stop.is_set() and payload['action'] != 'service-status':
                 raise DomainError('调度器正在有序停机', '保留请求编号，启动后查询相同编号')
-            if payload['action'] not in ('service-status', 'status', 'dashboard'):
+            if payload['action'] not in ('service-status', 'status', 'dashboard', 'role-inspector', 'role-output'):
                 self.last_activity = now()
                 self.wake.set()
-            answer = self.member({**payload, 'params': params}) if channel == 'member' else self.local(payload['action'], params)
+            if channel == 'member' and payload['action'] == 'native-relay':
+                if params.get('action') not in native_worker.PROTOCOL_ACTIONS or not isinstance(params.get('params'), dict):
+                    raise DomainError('原生角色不能调用此操作')
+                answer = self.member({**params, 'auth': payload.get('auth')}, native=True)
+            elif channel == 'member':
+                answer = self.member({**payload, 'params': params})
+            elif channel == 'local':
+                answer = self.local(payload['action'], params)
+            else:
+                raise DomainError('未知协调器通道')
             return {'ok': True, 'result': answer}
         except DomainError as error:
             return {'ok': False, 'error': str(error), 'next': error.next_step}
@@ -1053,25 +1290,44 @@ class Coordinator:
             lead = db.execute("SELECT terminal FROM bindings WHERE run_id=? AND active=1 AND kind='master'", (run['id'],)).fetchone()
             if binding['kind'] != 'master' and (not lead or not lead['terminal']):
                 return
-            db.execute("UPDATE bindings SET launch_state='launching',launch_evidence='' WHERE id=?", (binding_id,))
+            db.execute("UPDATE bindings SET launch_state='preparing',launch_evidence='' WHERE id=?", (binding_id,))
+        requested = False
         try:
             journal = self.journal_dir(binding)
             journal.mkdir(parents=True, exist_ok=True)
             _, prompt = self.bootstrap(run, binding, environment=True)
-            terminal = self.hc().launch(binding['provider'], cwd=run['root'], name='htc-' + binding_id[:20],
-                labels={'herdr.coord.run': run['id'], 'herdr.coord.binding': binding_id,
-                        'herdr.space': 'htc-' + run['id'], 'herdr.tab': 'htc-' + binding_id},
-                bootstrap=prompt, environment={'HERDR_COORD_ROOT': str(self.root), 'HERDR_COORD_BINDING': binding_id,
-                    'HERDR_COORD_TOKEN': binding['token'], 'HERDR_COORD_JOURNAL': str(journal)},
-                parent=lead['terminal'] if binding['kind'] != 'master' else None,
-                no_notify=(binding['kind'] != 'master'),
-                model=binding['model'], effort=binding['effort'], workspace_write=bool(binding['write_allowed']),
-                writable_dirs=(journal,) if binding['write_allowed'] else ())
+            with self.tx() as db:
+                if not self.get_binding(db, binding_id)['active'] or self.get_run(db, run['id'])['state'] != 'active':
+                    db.execute("UPDATE bindings SET launch_state='pending' WHERE id=?", (binding_id,))
+                    return
+                db.execute("UPDATE bindings SET launch_state='launching',launch_started=? WHERE id=?", (now(), binding_id))
+            requested = True
+            labels = {'herdr.coord.run': run['id'], 'herdr.coord.binding': binding_id,
+                      'herdr.space': 'htc-' + run['id'], 'herdr.tab': 'htc-' + binding_id}
+            environment = {'HERDR_COORD_ROOT': str(self.root), 'HERDR_COORD_BINDING': binding_id,
+                           'HERDR_COORD_TOKEN': binding['token'], 'HERDR_COORD_JOURNAL': str(journal)}
+            parent = lead['terminal'] if binding['kind'] != 'master' else None
+            name = 'htc-' + binding_id[:20]
+            if binding['execution_mode'] != 'legacy':
+                environment['HERDR_COORD_NATIVE'] = wire({
+                    'provider': binding['provider'], 'project': run['root'], 'journal': str(journal),
+                    'executable': self.hc().tools[binding['provider']], 'mode': binding['execution_mode'],
+                    'write': bool(binding['write_allowed']),
+                    'model': binding['model'], 'effort': binding['effort']})
+                terminal = self.hc().launch_worker(self.python_executable(), HERE / 'native_worker.py', cwd=run['root'],
+                    name=name, labels=labels, environment=environment, parent=parent)
+            else:
+                terminal = self.hc().launch(binding['provider'], cwd=run['root'], name=name, labels=labels,
+                    bootstrap=prompt, environment=environment, parent=parent, no_notify=bool(parent),
+                    model=binding['model'], effort=binding['effort'], workspace_write=bool(binding['write_allowed']),
+                    writable_dirs=(journal,) if binding['write_allowed'] else ())
             self.finish_binding(binding_id, terminal)
         except Exception as error:
             with self.tx() as db:
-                db.execute("UPDATE bindings SET launch_state='uncertain',launch_evidence=? WHERE id=? AND launch_state='launching'",
-                           (str(error)[:3000], binding_id))
+                db.execute("""UPDATE bindings SET launch_state=?,launch_evidence=?
+                              WHERE id=? AND launch_state IN ('preparing','launching')""",
+                           ('uncertain' if requested and not isinstance(error, ValueError) else 'launch_failed',
+                            str(error)[:3000], binding_id))
             self.notifier('Herdr 团队协调器待核实会话启动',
                 f'{binding["role_id"]} 的启动需要核对。请打开 herdr-app do mod.open --name herdr-team-coordinator。')
         finally:
@@ -1091,7 +1347,83 @@ class Coordinator:
                            (terminal['address'], terminal['instance'], t_health, t_status, binding_id))
                 if current['kind'] == 'master':
                     db.execute('UPDATE runs SET master_state=? WHERE id=?', (t_health, current['run_id']))
+                if current['execution_mode'] != 'legacy':
+                    run = self.get_run(db, current['run_id'])
+                    self.enqueue(db, run, binding_id, 'bootstrap', '角色接入，查询当前协作状态。')
                 self.audit(db, current['run_id'], 'terminal-bound', 'daemon', {'role': current['role_id'], 'address': terminal['address']})
+
+    def native_turn(self, db, binding, action, params):
+        run = self.get_run(db, binding['run_id'])
+        if action == 'native-failed':
+            evidence = required_text(params, 'evidence', 500)
+            db.execute("UPDATE bindings SET launch_state='launch_failed',launch_evidence=?,health='blocked' WHERE id=?",
+                       (evidence, binding['id']))
+            self.audit(db, run['id'], 'native-launch-failed', binding['role_id'], {'evidence': evidence})
+            return {'state': 'launch_failed'}
+        if action == 'native-finish':
+            if type(params.get('ok')) is not bool:
+                raise DomainError('缺少原生引擎回执')
+            stale = db.execute('SELECT state FROM outbox WHERE id=? AND binding_id=? AND attempt=? AND attempt_instance=?',
+                               (params.get('id'), binding['id'], params.get('attempt'), binding['instance'])).fetchone()
+            result = ('obsolete' if stale and stale['state'] == 'stale_delivery' else 'delivered') if params['ok'] else 'unknown'
+            evidence = required_text(params, 'evidence', 500)
+            updated = db.execute("""UPDATE outbox SET state=?,evidence=?,notice_at=NULL
+                WHERE id=? AND binding_id=? AND attempt=? AND attempt_instance=? AND state IN ('sending','stale_delivery')""",
+                (result, evidence, params.get('id'), binding['id'], params.get('attempt'), binding['instance']))
+            if updated.rowcount != 1:
+                raise DomainError('原生回合已经过期或已更换实例')
+            db.execute('UPDATE role_turns SET outcome=?,receipt=? WHERE attempt=?', (result, evidence, params.get('attempt')))
+            self.audit(db, run['id'], 'native-result', binding['role_id'], {'state': result, 'evidence': evidence})
+            return {'state': result}
+        if run['state'] != 'active':
+            return {}
+        if db.execute("""SELECT 1 FROM outbox WHERE binding_id=?
+            AND state IN ('sending','unknown','stale_delivery') LIMIT 1""", (binding['id'],)).fetchone():
+            return {}
+        for row in db.execute("""SELECT * FROM outbox WHERE binding_id=? AND state='queued'
+            AND not_before<=? ORDER BY created""", (binding['id'], now())).fetchall():
+            if self.delivery_state(db, row, binding) != 'valid':
+                continue
+            current_role = json.loads(binding['role_details'])
+            message = team_chat.lookup(db, run['id'], row['chat_id']) if row['chat_id'] else None
+            requirement = None
+            if row['task_id']:
+                requirement = task_requirements(db, run['id'], row['task_id'])
+            command = 'python -B $env:HERDR_COORD_PROGRAM'
+            if binding['provider'] in ('dsh','antigravity'):
+                entry = self.root / 'worker-runtime' / binding['id'] / 'coord_runtime.py'
+                command = f'python -B "{entry.as_posix()}"'
+            prompt = (f'You are role {binding["role_id"]} in Herdr team goal revision {run["revision"]}.\n'
+                      f'Goal: {run["goal"]}\nRole: {current_role.get("duties", "")}\n'
+                      f'Notification: {row["text"]}\nProject: {run["root"]}\n'
+                      f'Run {command} status. Use that executable for coord commands. '
+                      'Use status candidates with --task ID --ticket VALUE. Accept before work. '
+                      'Write only after request-write returns grant_id. If waiting, finish the turn. '
+                      'Handoff requires --paths and --json with evidence {stopped:true,processes,files,external}. '
+                      'Use a PowerShell here-string piped to --json - for JSON or nested quotes. '
+                      'Use relative paths. Never delete files or change the coordinator. Validate Python with ast.parse, not py_compile or compileall. '
+                      'Direct user task requirements in user_directives take precedence over conflicting lead text. '
+                      'Before writes or handoff re-check status and ack-task at the latest version. '
+                      'Lead can use change-goal, dispatch, amend-task or say with --source MESSAGE_ID. '
+                      'Worker answers direct user messages with say --source MESSAGE_ID --text TEXT. '
+                      'Use coord commands only for coordination. Finish the turn when awaiting more work.\n')
+            if message:
+                prompt += f'Chat message {message["id"]} from {message["sender"]}: {message["text"]}\n'
+            if requirement:
+                prompt += 'Assigned task snapshot:\n' + wire(requirement)[:45000] + '\n'
+            recent = [dict(item) for item in db.execute('''SELECT r.binding_id,r.delivery_id,r.attempt FROM role_turns r
+                WHERE r.binding_id=? ORDER BY r.seq DESC LIMIT 3''', (binding['id'],))]
+            previous = role_log.summary(self.control, recent)
+            if previous:
+                prompt += 'Your previous visible response (historical, verify against current status):\n' + previous + '\n'
+            attempt = new_id()
+            db.execute("""UPDATE outbox SET state='sending',attempt=?,attempt_instance=?,lease_until=?,consent=0
+                          WHERE id=?""", (attempt, binding['instance'], now() + 930, row['id']))
+            role_log.record(db, row, attempt, prompt, now())
+            credentials = {name: os.environ[name] for name in native_worker.ENV_BY_PROVIDER[binding['provider']]
+                           if os.environ.get(name)}
+            return {'id': row['id'], 'attempt': attempt, 'prompt': prompt, 'credentials': credentials}
+        return {}
 
     def delivery_state(self, db, row, binding=None):
         run = self.get_run(db, row['run_id'])
@@ -1099,17 +1431,29 @@ class Coordinator:
         if (row['revision'] != run['revision'] or run['state'] == 'accepted' or not binding['active'] or
                 not binding['terminal'] or binding['launch_state'] != 'bound'):
             return 'invalid'
-        if row['kind'] == 'offer':
-            task = db.execute('SELECT state,mode,round FROM tasks WHERE id=?', (row['task_id'],)).fetchone()
-            if not task or task['round'] != row['round'] or task['state'] not in ('offered', 'accepted'):
+        if row['kind'] == 'pause':
+            return 'held' if run['state'] == 'paused' else 'invalid'
+        if row['kind'] == 'chat' and row['chat_id'] and db.execute(
+                'SELECT 1 FROM team_messages WHERE run_id=? AND id=? AND result_hash IS NOT NULL',
+                (run['id'], row['chat_id'])).fetchone():
+            return 'invalid'
+        if row['task_id'] and row['kind'] in ('offer', 'workflow'):
+            task = db.execute('SELECT * FROM tasks WHERE id=?', (row['task_id'],)).fetchone()
+            if not task or task['round'] != row['round'] or task['binding_id'] != binding['id']:
                 return 'invalid'
-            if task['mode'] == 'write' and run['state'] == 'paused':
-                return 'held'
-        return 'valid'
+            if row['kind'] == 'offer' and task['state'] != 'offered':
+                return 'invalid'
+            if row['kind'] == 'workflow' and task['state'] not in ('queued','offered','accepted','blocked','yielded'):
+                return 'invalid'
+            if row['task_version'] is not None and (row['task_version'] != task['task_version'] or
+                                                     row['task_version'] <= task['ack_version']):
+                return 'invalid'
+        return 'held' if run['state'] == 'paused' else 'valid'
 
     @staticmethod
     def _auto_deliverable(binding):
-        return bool(binding['created_by_plugin'])
+        return binding['execution_mode'] == 'legacy' and bool(
+            binding['created_by_plugin'] or (binding['auto_push'] and binding['paired_at']))
 
     def deliver(self, identifier):
         attempt = new_id()
@@ -1128,7 +1472,7 @@ class Coordinator:
                            ('obsolete' if available == 'invalid' else 'queued', '发送资格已变化', identifier))
                 return
             concurrent = db.execute("""SELECT o.id FROM outbox o JOIN bindings b ON b.id=o.binding_id
-                WHERE b.instance=? AND o.state IN ('sending','unknown','stale_delivery')""", (binding['instance'],)).fetchone()
+                WHERE b.active=1 AND b.instance=? AND o.state IN ('sending','unknown','stale_delivery')""", (binding['instance'],)).fetchone()
             if concurrent:
                 return
             db.execute("""UPDATE outbox SET state='sending',attempt=?,attempt_instance=?,lease_until=?,consent=0
@@ -1139,21 +1483,34 @@ class Coordinator:
             try:
                 screen = adapter.read(binding['terminal'], lines=0)
                 blocker = screen_blocker_reason(screen, binding['provider'], is_master=(binding['kind'] == 'master'))
+                if not prompt_lines(screen):
+                    blocker = '暂时无法核对终端输入框。'
             except Exception:
-                blocker = None
+                blocker = '暂时无法读取终端输入框。'
         if blocker:
             should_notify = False
             with self.tx() as db:
                 current = db.execute('SELECT * FROM outbox WHERE id=?', (identifier,)).fetchone()
                 if current and current['attempt'] == attempt and current['state'] == 'sending':
                     should_notify = (current['notice_at'] is None) or (now() - current['notice_at'] >= 120)
-                    db.execute("UPDATE outbox SET state='queued',evidence=?,not_before=?,notice_at=CASE WHEN ? THEN ? ELSE notice_at END WHERE id=? AND attempt=?",
+                    db.execute("UPDATE outbox SET state=CASE WHEN seen_at IS NULL THEN 'queued' ELSE 'observed' END,evidence=?,not_before=?,notice_at=CASE WHEN ? THEN ? ELSE notice_at END WHERE id=? AND attempt=?",
                                (blocker, now() + 15, should_notify, now(), identifier, attempt))
             if should_notify:
                 self.notifier('Herdr 团队协调器暂停自动投递',
                     f'{binding["role_id"]}（{binding["terminal"]}）：{blocker}')
             self.wake.set()
             return
+        with self.tx() as db:
+            current = db.execute('SELECT * FROM outbox WHERE id=?', (identifier,)).fetchone()
+            if current['attempt'] != attempt or current['state'] not in ('sending','stale_delivery'):
+                return
+            available = self.delivery_state(db, current)
+            if current['seen_at'] is not None or current['state'] != 'sending' or available != 'valid':
+                state = ('observed' if current['seen_at'] is not None else
+                         'queued' if available == 'held' else 'obsolete')
+                db.execute('UPDATE outbox SET state=?,evidence=? WHERE id=?',
+                           (state, '发送前接收状态或投递资格已变化', identifier))
+                return
         try:
             # Keep terminal paste payload < 95 UTF-8 bytes so Windows ConPTY / Codex TUI never drops Enter;
             # full message text is persisted in outbox and read over the pipe via `coord status` -> inbox.
@@ -1173,10 +1530,13 @@ class Coordinator:
             if current['attempt'] != attempt or current['state'] not in ('sending', 'unknown', 'stale_delivery'):
                 return
             current_binding = self.get_binding(db, row['binding_id'])
-            valid = (current['state'] != 'stale_delivery' and self.delivery_state(db, current, current_binding) == 'valid' and
+            eligibility = self.delivery_state(db, current, current_binding)
+            valid = (current['state'] != 'stale_delivery' and eligibility in ('valid','held') and
                      current_binding['instance'] == current['attempt_instance'])
             state = {'delivered': 'delivered', 'unknown': 'unknown', 'not_sent': 'queued', 'blocked': 'queued'}[status]
-            if not valid:
+            if current['seen_at'] is not None and current['state'] != 'stale_delivery':
+                state = 'delivered' if status == 'delivered' else 'observed'
+            elif not valid:
                 state = 'stale_delivery' if status in ('delivered', 'unknown') else 'obsolete'
             ev_text = str(evidence)[:2500] or status
             retry_delay = 4 if ('working' in ev_text or 'status_mismatch' in ev_text) else 15
@@ -1268,6 +1628,8 @@ class Coordinator:
                     if state in ('blocked', 'lost'):
                         label = '已退出或实例变更' if state == 'lost' else f'处于 {t_status or "blocked"} 状态，等待处理'
                         self.relay(db, binding['run_id'], f"成员 {binding['role_id']}（{binding['terminal']}）{label}。")
+                    elif state == 'available' and current['paired_at']:
+                        self.relay(db, binding['run_id'], f"成员 {binding['role_id']}（{binding['terminal']}）已恢复可用。")
             if binding['kind'] == 'master' and master_changed and state != 'available':
                 self.notifier('Herdr 团队协调器需要恢复主控',
                     f'会话 {binding["terminal"]} 当前无法协调。运行 herdr-app do mod.open --name herdr-team-coordinator 打开恢复。')
@@ -1324,8 +1686,14 @@ class Coordinator:
                 db.execute("UPDATE tasks SET state='offered' WHERE id=?", (task['id'],))
                 self.enqueue(db, self.get_run(db, task['run_id']), task['binding_id'], 'offer', f'排队任务「{task["title"]}」可接单。', task)
             db.execute("UPDATE outbox SET consent=0 WHERE state='queued' AND consent=1 AND lease_until<?", (clock,))
-            db.execute("""UPDATE outbox SET state='unknown',evidence='发送超过核查时间，结果待核实，不会重发'
+            db.execute("""UPDATE outbox SET state=CASE WHEN seen_at IS NULL THEN 'unknown' ELSE 'observed' END,
+                          evidence='发送超过核查时间，结果待核实，不会重发'
                           WHERE state='sending' AND lease_until<?""", (clock,))
+            for row in db.execute("SELECT * FROM outbox WHERE state='unknown'").fetchall():
+                binding = self.get_binding(db, row['binding_id'])
+                if self.delivery_state(db, row, binding) == 'invalid':
+                    db.execute("UPDATE outbox SET state='obsolete',consent=0,evidence=evidence || ? WHERE id=?",
+                               ('；对应任务或对话已失效', row['id']))
             bindings = db.execute('''SELECT b.*,r.state AS run_state,r.master_state FROM bindings b JOIN runs r ON r.id=b.run_id
                                      WHERE b.active=1 ORDER BY CASE b.kind WHEN 'master' THEN 0 ELSE 1 END,b.id''').fetchall()
             binding_map = {b['id']: b for b in bindings}
@@ -1334,29 +1702,34 @@ class Coordinator:
             approved_ids = {row['id'] for row in approved}
             # Auto-deliver eligible queued messages for plugin-created or paired OSC-7501 idle/done terminals.
             busy_instances = {row[0] for row in db.execute('''SELECT DISTINCT b.instance FROM outbox o JOIN bindings b ON b.id=o.binding_id
-                WHERE b.instance IS NOT NULL AND (o.state IN ('sending','unknown','stale_delivery') OR (o.state='queued' AND o.consent=1))''')}
+                WHERE b.active=1 AND b.instance IS NOT NULL AND (o.state IN ('sending','unknown','stale_delivery') OR (o.state='queued' AND o.consent=1))''')}
             seen_auto_bindings = {row['binding_id'] for row in approved}
             for row in db.execute("SELECT * FROM outbox WHERE state='queued' AND consent=0 AND not_before<=? ORDER BY created", (clock,)):
                 binding = binding_map.get(row['binding_id'])
-                if not binding or binding['id'] in seen_auto_bindings or binding['instance'] in busy_instances:
+                if not binding:
+                    continue
+                available = self.delivery_state(db, row, binding)
+                if available == 'invalid' and binding['launch_state'] == 'bound':
+                    db.execute("UPDATE outbox SET state='obsolete',consent=0,evidence='发送资格已变化' WHERE id=?", (row['id'],))
+                if available != 'valid' or binding['id'] in seen_auto_bindings or binding['instance'] in busy_instances:
                     continue
                 if binding['health'] == 'available' and binding['terminal_status'] in ('idle', 'done') and self._auto_deliverable(binding):
-                    if self.delivery_state(db, row, binding) == 'valid':
-                        to_deliver.append(row)
-                        seen_auto_bindings.add(binding['id'])
-                        if binding['instance']:
-                            busy_instances.add(binding['instance'])
+                    to_deliver.append(row)
+                    seen_auto_bindings.add(binding['id'])
+                    if binding['instance']:
+                        busy_instances.add(binding['instance'])
             # Send a single gentle reminder if a delivered offer sits unaccepted on an idle member for >45s.
             for row in db.execute('''SELECT o.*, b.id AS bid FROM outbox o JOIN bindings b ON b.id=o.binding_id
                 JOIN tasks t ON t.id=o.task_id JOIN runs r ON r.id=o.run_id
-                WHERE o.kind='offer' AND o.state='delivered' AND o.reminded_at IS NULL AND o.created<=?
+                WHERE o.kind='offer' AND o.state IN ('delivered','observed') AND o.reminded_at IS NULL AND o.created<=?
                 AND t.state='offered' AND t.revision=r.revision AND r.state='active'
                 AND b.active=1 AND b.health='available' AND b.terminal_status IN ('idle','done')''', (clock - 45,)):
                 db.execute('UPDATE outbox SET reminded_at=? WHERE id=?', (clock, row['id']))
                 self.enqueue(db, self.get_run(db, row['run_id']), row['binding_id'], 'workflow',
-                             f'提醒：任务 {row["task_id"]} 已投递但尚未接单，请运行 coord status 并使用返回的接单参数执行 accept。')
+                             f'提醒：任务 {row["task_id"]} 已投递但尚未接单，请运行 coord status 并使用返回的接单参数执行 accept。',
+                             db.execute('SELECT * FROM tasks WHERE id=?', (row['task_id'],)).fetchone())
             interrupts = db.execute("SELECT * FROM interrupts WHERE state='queued' ORDER BY created").fetchall()
-            for row in db.execute('''SELECT o.*,b.role_id,b.terminal,b.created_by_plugin,b.paired_at,b.terminal_status
+            for row in db.execute('''SELECT o.*,b.role_id,b.terminal,b.created_by_plugin,b.auto_push,b.paired_at,b.terminal_status,b.execution_mode
                 FROM outbox o JOIN bindings b ON b.id=o.binding_id
                 WHERE o.state IN ('queued','delivered','unknown','stale_delivery') AND o.notice_at IS NULL AND o.not_before<=?
                 AND (b.active=1 OR o.state IN ('unknown','stale_delivery'))
@@ -1364,7 +1737,7 @@ class Coordinator:
                 ORDER BY o.created LIMIT 120''', (clock,)):
                 if row['id'] in approved_ids:
                     continue
-                if row['state'] == 'queued' and self._auto_deliverable(row):
+                if row['state'] == 'queued' and (row['execution_mode'] != 'legacy' or self._auto_deliverable(row)):
                     continue
                 if row['state'] == 'delivered' and row['created'] > clock - 90:
                     continue
@@ -1391,7 +1764,7 @@ class Coordinator:
             return True
         with self.tx(False) as db:
             return bool(db.execute('''SELECT 1 WHERE EXISTS(SELECT 1 FROM bindings b JOIN runs r ON r.id=b.run_id
-                WHERE b.active=1 AND r.state!='accepted' AND b.launch_state IN ('pending','launching','awaiting_bind'))
+                WHERE b.active=1 AND r.state!='accepted' AND b.launch_state IN ('pending','preparing','launching','uncertain','awaiting_bind'))
                 OR EXISTS(SELECT 1 FROM outbox WHERE state IN ('sending','unknown') OR (state IN ('queued','delivered') AND consent=1))
                 OR EXISTS(SELECT 1 FROM tasks t JOIN runs r ON r.id=t.run_id WHERE r.state!='accepted'
                            AND t.state IN ('queued','offered','accepted','blocked','yielded','needs_decision'))

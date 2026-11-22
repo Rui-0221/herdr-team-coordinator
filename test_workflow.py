@@ -117,6 +117,22 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(current['round'], 2)
         self.assertIn(STOPPED['handoff'], current['instructions'])
 
+    def test_writer_release_during_pause_preserves_wakeup_for_resume(self):
+        first, second = self.task('front'), self.task('back')
+        self.call('request-write', 'front', first)
+        self.assertTrue(self.call('request-write', 'back', second)['waiting'])
+        paused = self.call('pause', reason='wait for operator')
+        self.service.apply_notices(self.db, self.run_row(), paused)
+        result = self.call('yield', 'front', first, report='Stopped writing.', evidence=STOPPED)
+        self.service.apply_notices(self.db, self.run_row(), result)
+        notification = self.db.execute("SELECT * FROM outbox WHERE task_id=? AND kind='workflow'", (second,)).fetchone()
+        pause_notice = self.db.execute("SELECT * FROM outbox WHERE kind='pause' LIMIT 1").fetchone()
+        self.assertIsNotNone(notification)
+        self.assertEqual(self.service.delivery_state(self.db, notification), 'held')
+        self.call('resume')
+        self.assertEqual(self.service.delivery_state(self.db, notification), 'valid')
+        self.assertEqual(self.service.delivery_state(self.db, pause_notice), 'invalid')
+
     def test_old_receipt_can_only_release_original_grant(self):
         task = self.task('front')
         self.call('request-write', 'front', task)

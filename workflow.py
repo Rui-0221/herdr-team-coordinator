@@ -1,6 +1,7 @@
 """Versioned handoffs, write arbitration, and review decisions for the scheduler."""
 
 import json
+import os
 from pathlib import Path
 import time
 
@@ -22,6 +23,11 @@ def install_workflow_schema(db):
             task_id TEXT NOT NULL REFERENCES tasks(id), version INTEGER NOT NULL, round INTEGER NOT NULL,
             instructions TEXT NOT NULL, completion TEXT NOT NULL, recorded REAL NOT NULL,
             PRIMARY KEY(task_id, version)
+        );
+        CREATE TABLE IF NOT EXISTS workflow_user_directives (
+            task_id TEXT NOT NULL REFERENCES tasks(id), message_id TEXT NOT NULL,
+            version INTEGER NOT NULL, text TEXT NOT NULL, created REAL NOT NULL,
+            PRIMARY KEY(task_id,message_id)
         );
         CREATE TABLE IF NOT EXISTS workflow_grants (
             id TEXT PRIMARY KEY, run_id TEXT NOT NULL REFERENCES runs(id),
@@ -94,16 +100,19 @@ def amend_task(db, run, actor, params):
     if (not task or task['kind'] != 'member' or run['state'] != 'active' or task['revision'] != run['revision']
             or task['state'] not in ('queued','offered','accepted','blocked','yielded','handed_off')):
         raise DomainError('请选择当前目标下可调整的执行任务。')
-    if actor['kind'] != 'master' and task['binding_id'] != actor['binding_id']:
+    if actor['kind'] not in ('master','user') and task['binding_id'] != actor['binding_id']:
         raise DomainError('成员仅可调整自己的执行任务。')
     check_task_version(task, params)
+    direct = actor['kind'] == 'user'
+    if direct and db.execute('SELECT count(*) FROM workflow_user_directives WHERE task_id=?', (task['id'],)).fetchone()[0] >= 20:
+        raise DomainError('此任务已达到用户调整的条目上限')
     mode = params.get('edit', 'append')
-    if mode not in ('append','replace') or not any(k in params for k in ('instructions','completion')):
+    if not direct and (mode not in ('append','replace') or not any(k in params for k in ('instructions','completion'))):
         raise DomainError('需要提供执行要求或验收条件。')
     values = {}
     for key in ('instructions','completion'):
         value = task[key]
-        if key in params:
+        if not direct and key in params:
             addition = _required(params, key, key)
             value = value + '\n' + addition if mode == 'append' else addition
         if len(value) > 24000:
@@ -124,8 +133,12 @@ def amend_task(db, run, actor, params):
                (values['instructions'], values['completion'], state, round_no, ticket, task['id']))
     invalidate_review(db, run['id'], '任务要求或验收条件已更新。')
     version = task['task_version'] + 1
+    if direct:
+        db.execute('INSERT INTO workflow_user_directives VALUES(?,?,?,?,?)',
+                   (task['id'], params['message_id'], version, params['text'].strip(), now()))
     return {'task_id': task['id'], 'task_version': version, 'state': state,
             '_notices': [{'binding_id': task['binding_id'], 'task_id': task['id'],
+                          'task_version': version,
                           'text': f'任务「{task["title"]}」已更新到第 {version} 版，请查看要求并 ack-task。'}]}
 
 
@@ -134,12 +147,23 @@ def task_requirements(db, run_id, task_id, version=None):
     if not task:
         raise DomainError('找不到本团队的任务')
     if version is None or version == task['task_version']:
-        return {key: task[key] for key in ('id','task_version','round','instructions','completion')}
+        return {**{key: task[key] for key in ('id','task_version','round','instructions','completion')},
+                'user_directives': user_directives(db, task_id, task['task_version'])}
     row = _row(db, '''SELECT task_id AS id,version AS task_version,round,instructions,completion
                       FROM workflow_task_versions WHERE task_id=? AND version=?''', task_id, version)
     if not row:
         raise DomainError('任务需求版本不存在')
-    return dict(row)
+    return {**dict(row), 'user_directives': user_directives(db, task_id, version)}
+
+
+def user_directives(db, task_id, version=None):
+    return [dict(row) for row in db.execute('''SELECT message_id,version,text,created FROM workflow_user_directives
+        WHERE task_id=? AND (? IS NULL OR version<=?) ORDER BY version,created''', (task_id, version, version))]
+
+
+def carry_user_directives(db, prior, replacement):
+    db.execute('''INSERT INTO workflow_user_directives(task_id,message_id,version,text,created)
+        SELECT ?,message_id,1,text,created FROM workflow_user_directives WHERE task_id=?''', (replacement, prior))
 
 
 def check_task_version(task, params):
@@ -318,7 +342,7 @@ def _release_grant(db, grant, evidence):
     ready = db.execute('''SELECT w.*, t.binding_id, r.revision FROM workflow_waits w
                           JOIN tasks t ON t.id=w.task_id JOIN runs r ON r.id=w.run_id
                           JOIN bindings b ON b.id=t.binding_id
-                          WHERE w.holder_id=? AND w.state='waiting' AND b.active=1 AND r.state='active'
+                          WHERE w.holder_id=? AND w.state='waiting' AND b.active=1 AND r.state IN ('active','paused')
                           AND t.revision=r.revision AND t.state IN ('accepted','blocked','yielded')
                           ORDER BY w.created''', (grant['id'],)).fetchall()
     db.execute("UPDATE workflow_waits SET state='ready', reason='原资格已核对并释放。', next_check=? WHERE holder_id=? AND state='waiting'",
@@ -356,7 +380,7 @@ def _wait_ready_notices(ready_waits):
 def _declared_stopped(params, *, recovery=False):
     evidence = params.get('evidence')
     if not isinstance(evidence, dict) or evidence.get('stopped') is not True:
-        raise DomainError('缺少停写确认。', '确认写入操作及后台写入均已停止，再提交证据。')
+        raise DomainError('缺少停写确认。', '确认停写后，传入 evidence 对象及 stopped=true。PowerShell 可把 JSON 通过管道传给 --json -。')
     required = ('terminal', 'processes', 'files', 'handoff', 'external') if recovery else ('processes', 'files', 'external')
     return {'stopped': True, **{key: _required(evidence, key, f'停写证据 {key}', 2000) for key in required}}
 
@@ -505,9 +529,18 @@ def _handover(db, run, actor, params, kind):
             raise DomainError('这轮写入任务从未获得写入资格。', '记录只读进度，或等待主控安排补齐工作。')
         root = Path(run['root']).resolve()
         for path in paths:
-            supplied = Path(path_key((root / path).resolve()))
+            target = root / path
+            supplied = Path(path_key(target.resolve()))
             if not any(supplied.is_relative_to(Path(grant['path'])) for grant in history):
                 raise DomainError(f'交付路径超出本轮写入资格：{path}。', '核对实际工作树和交付范围。')
+            if os.name == 'nt':
+                try:
+                    if target.is_file():
+                        with target.open('rb'):
+                            pass
+                except PermissionError as exc:
+                    raise DomainError(f'协调器无法读取交付文件：{path}。',
+                                      '请本地核对文件 ACL，确保协调器属主可读。修复后重试，或明确停写后用 yield 交还资格。') from exc
     evidence = _declared_stopped(params) if grants else None
     ready_waits = _release(db, task, evidence)
     receipt = new_id()
@@ -560,10 +593,12 @@ def _pause(db, run, params):
                (run['id'], run['revision'], reason, int(emergency), _dump(checkpoint), now()))
     invalidate_review(db, run['id'], '运行暂停。')
     invalidate_question(db, run['id'], '运行暂停。')
-    db.execute("UPDATE workflow_waits SET state='cancelled' WHERE run_id=? AND state IN ('waiting','ready')", (run['id'],))
+    if emergency:
+        db.execute("UPDATE workflow_waits SET state='cancelled' WHERE run_id=? AND state IN ('waiting','ready')", (run['id'],))
     db.execute('''UPDATE outbox SET consent=0 WHERE run_id=? AND state='queued' AND task_id IN
                   (SELECT id FROM tasks WHERE run_id=? AND mode='write')''', (run['id'], run['id']))
-    notices = [{'binding_id': row['binding_id'], 'text': f"运行已暂停。任务 {row['id']}：{reason}\n请停止写入，核对后台进程和外部操作，提交 yield 及进度。"}
+    notices = [{'binding_id': row['binding_id'], 'kind': 'pause',
+                'text': f"运行已暂停。任务 {row['id']}：{reason}\n请停止写入，核对后台进程和外部操作，提交 yield 及进度。"}
                for row in active if row['mode'] == 'write' and row['state'] in ('accepted','blocked')]
     return {'state': 'paused', 'checkpoint': checkpoint, '_notices': notices}
 
@@ -589,6 +624,7 @@ def _resume(db, run, params, offer):
         binding = _binding(db, run['id'], task['role_id'], 'member')
         context = _row(db, "SELECT report FROM workflow_handoffs WHERE task_id=? ORDER BY rowid DESC LIMIT 1", task['id'])
         db.execute("UPDATE tasks SET state='superseded' WHERE id=?", (task['id'],))
+        db.execute("UPDATE workflow_waits SET state='cancelled' WHERE task_id=? AND state IN ('waiting','ready')", (task['id'],))
         db.execute("UPDATE outbox SET state='obsolete', consent=0 WHERE task_id=? AND state='queued'", (task['id'],))
         current = _row(db, 'SELECT * FROM runs WHERE id=?', run['id'])
         instructions = f"{task['instructions']}\n\n继续原任务 {task['id']}。"
@@ -624,8 +660,10 @@ def _change_goal(db, run, params):
     revoked = []
     decisions = []
     for task in old_tasks:
-        if task['state'] == 'queued' or task['state'] == 'offered' and not _row(db, '''SELECT id FROM outbox WHERE task_id=?
-                AND state IN ('sending','delivered','unknown','stale_delivery') LIMIT 1''', task['id']):
+        sent = _row(db, '''SELECT id FROM outbox WHERE task_id=?
+            AND state IN ('sending','delivered','unknown','stale_delivery') LIMIT 1''', task['id'])
+        has_directive = _row(db, 'SELECT 1 FROM workflow_user_directives WHERE task_id=? LIMIT 1', task['id'])
+        if not has_directive and (task['state'] == 'queued' or task['state'] == 'offered' and not sent):
             db.execute("UPDATE tasks SET state='cancelled' WHERE id=?", (task['id'],))
             revoked.append(task['id'])
         else:
@@ -699,6 +737,8 @@ def _resolve_revision(db, run, params, offer):
         replacement = offer(db, run, binding, prior['title'], instructions, prior['required'], completion, prior['mode'])
     else:
         db.execute("UPDATE tasks SET state='cancelled' WHERE id=?", (prior['id'],))
+    if replacement:
+        carry_user_directives(db, prior['id'], replacement)
     db.execute('''INSERT INTO workflow_revision_decisions(task_id,run_id,revision,decision,carried,replacement_task,created)
                   VALUES(?,?,?,?,?,?,?) ON CONFLICT(task_id) DO UPDATE SET revision=excluded.revision, decision=excluded.decision,
                   carried=excluded.carried,replacement_task=excluded.replacement_task,created=excluded.created''',
@@ -765,6 +805,8 @@ def _review_start(db, run, params, offer):
     report_lines = [f"{handoff['role_id']} / {handoff['task_id']} / 第 {handoff['round']} 轮 / 交接 {handoff['id']} / 任务版本 {handoff['task_version']}\n要求：{handoff['instructions']}\n验收：{handoff['completion']}"
                     for handoff in handoffs]
     instructions = (f"以只读方式审查目标版本 {run['revision']} 的成果。\n审查编号 {review_id}\n"
+                    "先用 coord status 获取候选任务的 task 和 ticket，再用 coord accept 接单。"
+                    "完成审查后，用同一 task、ticket 和上面的 review_id 执行 coord review-submit。\n"
                     f"工作目录：{run['root']}\n成果清单：{_dump(paths)}\n指纹：{manifest['digest']}\n"
                     f"目标：{run['goal']}\n交接清单：\n" + ('\n'.join(report_lines) or '无'))
     task_id = offer(db, run, reviewer, '独立审查', instructions, 0, '提交可复核的结论和证据。', 'read')
@@ -793,8 +835,10 @@ def _review_recheck(db, run, review):
 def _review_submit(db, run, actor, params):
     task = _task_actor(db, actor, run)
     review = _row(db, "SELECT * FROM workflow_reviews WHERE id=? AND run_id=? AND state='pending'", params.get('review_id'), run['id'])
-    if not review or review['task_id'] != task['id'] or review['binding_id'] != actor['binding_id'] or task['state'] != 'accepted':
-        raise DomainError('审查编号与已接单的独立审查轮次不匹配。', '核对目标版本与审查编号。')
+    if not review or review['task_id'] != task['id'] or review['binding_id'] != actor['binding_id']:
+        raise DomainError('审查编号与当前独立审查轮次不匹配。', '核对目标版本与审查编号。')
+    if task['state'] != 'accepted':
+        raise DomainError('独立审查任务尚未接单。', '先用 coord accept 提交该任务的 task 和 ticket，再重试 review-submit。')
     verdict = params.get('verdict')
     if verdict not in ('pass', 'fail'):
         raise DomainError('审查结论须为 pass 或 fail。')

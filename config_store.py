@@ -117,7 +117,7 @@ def _role(source):
 
 
 def _member(source, roles):
-    _object(source, {"id", "role", "kind", "agent", "model", "effort", "write_allowed"}, "成员")
+    _object(source, {"id", "role", "kind", "agent", "model", "effort", "write_allowed", "execution_mode"}, "成员")
     member_id = _id(source.get("id"))
     role_id = _id(source.get("role"))
     if role_id not in roles:
@@ -135,11 +135,14 @@ def _member(source, roles):
     if not isinstance(effort, str) or effort not in EFFORTS:
         raise ValueError(f"成员 {member_id} 的思考强度无效")
     write_allowed = _boolean(source.get("write_allowed", False), "成员写入资格")
+    execution_mode = source.get("execution_mode", "legacy")
+    if execution_mode not in ("legacy", "approval", "full_auto"):
+        raise ValueError(f"成员 {member_id} 的执行权限档位无效")
     if write_allowed and kind not in {"developer", "specialist"}:
         raise ValueError("写入资格仅可配置给开发或攻坚成员")
     return {
         "id": member_id, "role": role_id, "kind": kind, "agent": agent,
-        "model": model, "effort": effort, "write_allowed": write_allowed,
+        "model": model, "effort": effort, "write_allowed": write_allowed, "execution_mode": execution_mode,
     }
 
 
